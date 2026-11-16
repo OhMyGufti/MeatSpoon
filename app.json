@@ -1,0 +1,45 @@
+{
+  "expo": {
+    "name": "MeatSpoon",
+    "slug": "meatspoon-app",
+    "scheme": "meatspoon",
+    "version": "1.0.1",
+    "orientation": "default",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "icon": "./assets/icon.png",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#111827"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.technion.meatspoon"
+    },
+    "android": {
+      "package": "com.technion.meatspoon",
+      "versionCode": 2,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#111827"
+      }
+    },
+    "web": {
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-status-bar",
+      "expo-web-browser",
+      "expo-sharing"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "ad938f54-572c-462d-a1f5-0bae47d7b48f"
+      }
+    },
+    "experiments": {
+      "baseUrl": "/MeatSpoon"
+    }
+  }
+}
