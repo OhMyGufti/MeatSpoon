@@ -17,6 +17,15 @@ export interface CourseReviewsAiSummary {
 
 export const COURSE_SUMMARY_CACHE_PREFIX = '@MeatSpoon_CourseSummary_';
 
+/**
+ * CheeseFork's public Firebase project ID (can be overridden via EXPO_PUBLIC_CHEESEFORK_PROJECT_ID).
+ * Collection: `courseFeedback`
+ * Document ID: `${courseId}`
+ * Field: `posts` (array of mapValues containing `text`, `semester`, `generalRank`, `difficultyRank`, `author`, `timestamp`)
+ */
+export const CHEESEFORK_FIREBASE_PROJECT_ID =
+  process.env.EXPO_PUBLIC_CHEESEFORK_PROJECT_ID || 'cheesefork-de9af';
+
 export const GEMINI_COURSE_REVIEWS_SYSTEM_INSTRUCTION = `אתה עוזר וירטואלי לסטודנטים בטכניון. קרא את כל הביקורות הגולמיות הבאות על הקורס. חלץ ונתח אותן, והחזר את התשובה אך ורק במבנה ה-JSON הבא:
 
 generalCourseSummary: פסקה אחת שמסכמת את הדעה הכללית על הקורס עצמו (רמת קושי, עומס, עניין).
@@ -27,22 +36,163 @@ additionalReviews: מערך של אנשי סגל או שמות שעלו בביק
 ענה בעברית בלבד.`;
 
 /**
- * Placeholder service function that returns a mocked array of raw student reviews
- * from CheeseFork (mixing general course impressions, specific lecturers, TAs, and unattributed feedback).
+ * Cleans unfilled template headers from a CheeseFork review post,
+ * matching `preprocessPostText` in CheeseFork's `course-feedback.js`.
  */
-export async function fetchRawCourseReviews(courseId: string): Promise<string[]> {
-  // Simulate brief network latency
-  await new Promise((resolve) => setTimeout(resolve, 250));
+export function preprocessCheeseForkPostText(rawText: string): string {
+  let text = rawText || '';
+  const templateParts = [
+    'שם המרצה:',
+    'חוות דעת - הרצאות:',
+    'שם המתרגל/ת:',
+    'חוות דעת - תרגולים:',
+    'שעורי הבית:',
+    'המבחן:',
+    'השורה התחתונה:',
+  ].filter((part) => text.indexOf(part) !== -1);
 
-  return [
-    `קורס ${courseId} הוא אחד הקורסים החשובים והמעניינים בתואר, אבל אל תזלזלו בעומס שלו! גיליונות הבית דורשים המון השקעה ולוקחים לפחות יומיים בשבוע, והמבחן הסופי ברמה גבוהה מאוד אך הוגן למי שפתר מבחנים משנים קודמות.`,
-    `המרצה פרופ' דן גייגר מעביר את החומר בצורה מרתקת ובהירה מאוד. ההרצאות שלו מסודרות, הוא עונה בסבלנות על שאלות ומביא דוגמאות מצוינות שממש עוזרות להבין את האינטואיציה שמאחורי המשפטים. מומלץ בחום להגיע להרצאות שלו (5/5).`,
-    `המרצה ד"ר יעל כהן נחמדה מאוד ומשתדלת לעזור בשעות קבלה, אבל לפעמים היא רצה מהר מדי על השקפים וההסברים בכיתה קצת פחות אינטואיטיביים לחלק הראשון של הסמסטר (3.5/5).`,
-    `המתרגל תומר לוי פשוט אלוף! התרגולים שלו מצילים את הקורס. הוא פותר שאלות ברמת מבחן שלב אחר שלב, מסכם את כל הטריקים החשובים על הלוח ותמיד זמין במייל לשאלות. אל תפספסו את הקבוצה שלו!`,
-    `המתרגלת נועה שפירא מעבירה את התרגול בצורה מסודרת וברורה, הקצב שלה טוב והיא מחלקת דפי סיכום מעולים לפני המבחן, אם כי לפעמים לא מספיקים את כל השאלות בדף התרגול (4/5).`,
-    `שמעתי מסטודנטים שלקחו עם אלון ברק שהמצגות שלו מעולות ומומלץ להוריד אותן מהמודל, למרות שלא ברור אם הוא מרצה או מתרגל אחראי הסמסטר.`,
-    `טיפ כללי לכל מי שלוקח את הקורס: תתחילו את המטלות הרטובות מוקדם עם שותף טוב, ותפתרו לפחות 6-7 מבחנים ממועדים אחרונים כי שאלות הקצה במבחן חוזרות על רעיונות דומים מהתרגולים.`,
-  ];
+  for (let i = 0; i + 1 < templateParts.length; i++) {
+    const t1 = templateParts[i];
+    const t2 = templateParts[i + 1];
+    const regex = new RegExp(`${t1}\\s*${t2}`);
+    text = text.replace(regex, t2);
+  }
+
+  if (templateParts.length > 0) {
+    const t1Last = templateParts[templateParts.length - 1];
+    const regexLast = new RegExp(`${t1Last}\\s*$`);
+    text = text.replace(regexLast, '');
+  }
+
+  return text.trim();
+}
+
+/**
+ * Converts a Technion 8-digit SAP course ID (e.g. "02340124") to its legacy 6-digit ID ("234124")
+ * so we can query both if needed.
+ */
+function toLegacy6DigitCourseId(courseId: string): string | null {
+  const trimmed = courseId.trim();
+  if (/^0\d{3}0\d{3}$/.test(trimmed)) {
+    return trimmed.slice(1, 4) + trimmed.slice(5, 8);
+  }
+  return null;
+}
+
+/**
+ * Extracts the string array of reviews from a Firestore REST API document JSON response
+ * for `projects/{projectId}/databases/(default)/documents/courseFeedback/{courseId}`.
+ */
+function extractReviewsFromFirestoreRestDoc(docJson: any): string[] {
+  const values = docJson?.fields?.posts?.arrayValue?.values;
+  if (!Array.isArray(values)) {
+    return [];
+  }
+
+  const extractedReviews: string[] = [];
+
+  for (const item of values) {
+    const postFields = item?.mapValue?.fields;
+    if (!postFields) continue;
+
+    const rawText = String(postFields?.text?.stringValue || '').trim();
+    if (!rawText) continue;
+
+    const cleanedText = preprocessCheeseForkPostText(rawText);
+    if (!cleanedText) continue;
+
+    const semester = String(postFields?.semester?.stringValue || '').trim();
+    const generalRank = Number(
+      postFields?.generalRank?.integerValue ??
+        postFields?.generalRank?.doubleValue ??
+        NaN
+    );
+    const difficultyRank = Number(
+      postFields?.difficultyRank?.integerValue ??
+        postFields?.difficultyRank?.doubleValue ??
+        NaN
+    );
+
+    const metaParts: string[] = [];
+    if (semester) metaParts.push(`סמסטר: ${semester}`);
+    if (Number.isFinite(generalRank) && generalRank > 0) {
+      metaParts.push(`דירוג כללי: ${generalRank}/5`);
+    }
+    if (Number.isFinite(difficultyRank) && difficultyRank > 0) {
+      metaParts.push(`דירוג עומס: ${difficultyRank}/5`);
+    }
+
+    const formattedReview =
+      metaParts.length > 0
+        ? `[${metaParts.join(' | ')}]\n${cleanedText}`
+        : cleanedText;
+
+    extractedReviews.push(formattedReview);
+  }
+
+  return extractedReviews;
+}
+
+/**
+ * Helper that queries a single document ID in the `courseFeedback` collection
+ * via the public Firebase Firestore v1 REST API.
+ */
+async function fetchFirestoreCourseFeedbackDoc(
+  docId: string
+): Promise<string[]> {
+  const endpoint = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+    CHEESEFORK_FIREBASE_PROJECT_ID
+  )}/databases/(default)/documents/courseFeedback/${encodeURIComponent(docId)}`;
+
+  const response = await fetch(endpoint, {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+    },
+  });
+
+  if (response.status === 404) {
+    return [];
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      `שגיאה בשליפת ביקורות מ-CheeseFork (HTTP ${response.status}).`
+    );
+  }
+
+  const docJson = await response.json();
+  return extractReviewsFromFirestoreRestDoc(docJson);
+}
+
+/**
+ * Fetches raw student reviews for `courseId` from CheeseFork's public Firestore database
+ * (`collection('courseFeedback').doc(courseId)`) using the public Firebase REST API.
+ * Queries both the given `courseId` (e.g. 8-digit SAP ID "02340124") and its 6-digit
+ * legacy Technion ID ("234124") if applicable, combining unique reviews.
+ */
+export async function fetchRawCourseReviews(
+  courseId: string
+): Promise<string[]> {
+  const cleanId = courseId.trim();
+  if (!cleanId) return [];
+
+  const primaryReviews = await fetchFirestoreCourseFeedbackDoc(cleanId);
+
+  const legacyId = toLegacy6DigitCourseId(cleanId);
+  if (!legacyId || legacyId === cleanId) {
+    return primaryReviews;
+  }
+
+  try {
+    const legacyReviews = await fetchFirestoreCourseFeedbackDoc(legacyId);
+    if (legacyReviews.length === 0) {
+      return primaryReviews;
+    }
+    return Array.from(new Set([...primaryReviews, ...legacyReviews]));
+  } catch {
+    return primaryReviews;
+  }
 }
 
 export class GeminiQuotaExceededError extends Error {
@@ -115,7 +265,7 @@ export async function clearCachedCourseSummary(courseId: string): Promise<void> 
 /**
  * Gets the AI-generated course reviews summary for `courseId`.
  * 1. Checks AsyncStorage (`@MeatSpoon_CourseSummary_${courseId}`) unless `forceRefresh` is true.
- * 2. If not cached, fetches raw reviews via `fetchRawCourseReviews(courseId)`,
+ * 2. If not cached, fetches raw reviews via `fetchRawCourseReviews(courseId)` from CheeseFork's Firestore REST API,
  *    calls Gemini (`gemini-2.5-flash` in JSON mode), parses the response, and caches it.
  */
 export async function getCourseReviewsAiSummary(
@@ -143,6 +293,20 @@ export async function getCourseReviewsAiSummary(
     }
   }
 
+  const rawReviews = await fetchRawCourseReviews(courseId);
+
+  if (rawReviews.length === 0) {
+    const emptySummary: CourseReviewsAiSummary = {
+      generalCourseSummary: 'לא קיימות חוות דעת לקורס זה במאגר CheeseFork.',
+      staff: [],
+      additionalReviews: [],
+    };
+    return {
+      summary: emptySummary,
+      fromCache: false,
+    };
+  }
+
   const apiKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY || '';
   if (!apiKey.trim()) {
     throw new Error(
@@ -151,8 +315,6 @@ export async function getCourseReviewsAiSummary(
   }
 
   try {
-    const rawReviews = await fetchRawCourseReviews(courseId);
-
     const genAI = new GoogleGenerativeAI(apiKey.trim());
     const model = genAI.getGenerativeModel({
       model: 'gemini-2.5-flash',
@@ -162,7 +324,7 @@ export async function getCourseReviewsAiSummary(
       },
     });
 
-    const userPrompt = `מספר קורס: ${courseId}\n\nלהלן הביקורות הגולמיות של הסטודנטים על הקורס:\n${JSON.stringify(
+    const userPrompt = `מספר קורס: ${courseId}\n\nלהלן הביקורות הגולמיות של הסטודנטים על הקורס (${rawReviews.length} ביקורות):\n${JSON.stringify(
       rawReviews,
       null,
       2
