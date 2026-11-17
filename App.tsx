@@ -44,14 +44,11 @@ import {
 import {
   MOODLE_LOGIN_URL,
   MOODLE_CALENDAR_EXPORT_PAGE_URL,
-  MOODLE_CALENDAR_EXPORT_URL,
-  MOODLE_UPCOMING_EVENTS_URL,
   MOODLE_INJECTED_SYNC_SCRIPT,
   MOODLE_BG_INJECTED_SYNC_SCRIPT,
   isMoodleAuthenticatedUrl,
   isMoodleLoginRedirectUrl,
   parseMoodleSyncPayload,
-  parseMoodleWebImportText,
   mergeSyncedTasks,
 } from './src/services/moodleSync';
 import {
@@ -60,8 +57,6 @@ import {
   WEBWORK_MOODLE_NAVIGATION_HELPER_SCRIPT,
   isWebworkAuthenticatedUrl,
   parseWebworkSyncPayload,
-  parseWebworkTextInput,
-  WebworkCourseOverride,
 } from './src/services/webworkSync';
 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu'];
@@ -477,7 +472,6 @@ export default function App() {
   const [moodleModalVisible, setMoodleModalVisible] = useState(false);
   const [moodleCurrentUrl, setMoodleCurrentUrl] = useState(MOODLE_LOGIN_URL);
   const [moodleSyncing, setMoodleSyncing] = useState(false);
-  const [moodleWebPasteText, setMoodleWebPasteText] = useState('');
   const moodleWebViewRef = useRef<WebView<{}> | null>(null);
 
   // Silent Background Moodle Sync on Mount & Auto-Login Prompt Setting (Native WebView only)
@@ -497,13 +491,6 @@ export default function App() {
   const [webworkModalVisible, setWebworkModalVisible] = useState(false);
   const [webworkCurrentUrl, setWebworkCurrentUrl] = useState(WEBWORK_LOGIN_URL);
   const [webworkSyncing, setWebworkSyncing] = useState(false);
-  const [webworkWebPasteText, setWebworkWebPasteText] = useState('');
-  const [webworkWebCourseKey, setWebworkWebCourseKey] = useState<string | null>(null);
-  const [webworkWebDropdownOpen, setWebworkWebDropdownOpen] = useState(false);
-  const [webSyncFeedback, setWebSyncFeedback] = useState<{
-    message: string;
-    isError: boolean;
-  } | null>(null);
   const webworkWebViewRef = useRef<WebView<{}> | null>(null);
   const [aboutModalVisible, setAboutModalVisible] = useState(false);
   const [searchModalVisible, setSearchModalVisible] = useState(false);
@@ -1155,174 +1142,33 @@ export default function App() {
       if (syncedTasks.length === 0) {
         const msg = `0 upcoming tasks were found from ${sourceLabel}.`;
         showToastNotification(msg, 'warning');
-        if (Platform.OS !== 'web') {
-          Alert.alert(`${sourceLabel} Sync Complete`, msg);
-        }
+        Alert.alert(`${sourceLabel} Sync Complete`, msg);
       } else {
         const icon = sourceLabel === 'Webwork' ? '💻' : '🎓';
-        const msg = `Synced ${syncedTasks.length} assignment(s) from ${sourceLabel} (${newlyAddedCount} new added).`;
-        showToastNotification(`${icon} ${msg}`, 'success');
-        if (Platform.OS !== 'web') {
-          Alert.alert(`${icon} ${sourceLabel} Sync Successful`, msg);
-        }
+        const msg = `Synced ${syncedTasks.length} assignment(s) from ${sourceLabel} (${newlyAddedCount} new added to your local schedule).`;
+        showToastNotification('המטלות סונכרנו בהצלחה', 'success');
+        Alert.alert(`${icon} ${sourceLabel} Sync Successful`, msg);
       }
     }
   };
 
-  // Shows both native Alert and Web-visible inline feedback/toast (since RN Web Alert.alert is a no-op)
-  const notifyWebOrNative = (title: string, message: string, isError = false) => {
-    setWebSyncFeedback({ message: `${title}: ${message}`, isError });
-    showToastNotification(`${title} — ${message}`, isError ? 'warning' : 'success');
-    if (Platform.OS !== 'web') {
-      Alert.alert(title, message);
-    }
-  };
-
-  // Opens external URL in a new browser tab on Web (or via Linking on Native)
-  const openExternalBrowserUrl = (url: string) => {
+  // Strict Web-only window.open fallback (NEVER invokes Linking.openURL or external browsers on Mobile)
+  const openWebOnlyUrl = (url: string) => {
     if (
       Platform.OS === 'web' &&
       typeof window !== 'undefined' &&
       typeof window.open === 'function'
     ) {
-      const opened = window.open(url, '_blank', 'noopener,noreferrer');
-      if (opened) return;
-    }
-    Linking.openURL(url).catch(() =>
-      notifyWebOrNative('Cannot Open Link', url, true)
-    );
-  };
-
-  // Reads clipboard text into a state setter (works on Web & Native)
-  const handlePasteFromClipboard = async (
-    setter: (value: string) => void
-  ): Promise<string> => {
-    try {
-      let clipText = '';
-      if (
-        Platform.OS === 'web' &&
-        typeof navigator !== 'undefined' &&
-        navigator.clipboard &&
-        typeof navigator.clipboard.readText === 'function'
-      ) {
-        clipText = await navigator.clipboard.readText();
-      } else {
-        clipText = await Clipboard.getStringAsync();
-      }
-      if (clipText && clipText.trim()) {
-        setWebSyncFeedback(null);
-        setter(clipText);
-        return clipText;
-      }
-      notifyWebOrNative(
-        'Clipboard Empty',
-        'No text was found in your clipboard. Copy the data first or paste manually (Ctrl+V).',
-        true
-      );
-      return '';
-    } catch {
-      notifyWebOrNative(
-        'Paste Manually',
-        'Browser clipboard access was blocked. Tap the text box and press Ctrl+V (or long-press Paste).',
-        true
-      );
-      return '';
+      window.open(url, '_blank', 'noopener,noreferrer');
     }
   };
 
-  // Web/PWA: Process Moodle .ics file or copied Upcoming Events / JSON text
-  const handleWebMoodleImportContent = async (rawContent: string) => {
-    const syncedTasks = parseMoodleWebImportText(
-      rawContent,
-      eventsRef.current,
-      catalogRef.current
-    );
-    if (syncedTasks.length === 0) {
-      notifyWebOrNative(
-        'No Moodle Tasks Found',
-        'Could not detect Moodle assignments in this file or text. Try downloading icalexport.ics from Moodle Calendar Export or copying Upcoming Events.',
-        true
-      );
-      return;
-    }
-
-    setWebSyncFeedback(null);
-    setMoodleWebPasteText('');
-    setMoodleModalVisible(false);
-    await applySyncedTasks(syncedTasks, 'Moodle', true);
-  };
-
-  // Web/PWA: Trigger native browser file chooser for Moodle icalexport.ics
-  const handlePickMoodleIcsFileOnWeb = () => {
-    if (Platform.OS !== 'web' || typeof document === 'undefined') return;
-    setWebSyncFeedback(null);
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.ics,.ical,.txt,text/calendar';
-    input.onchange = () => {
-      const file = input.files && input.files[0];
-      if (!file) return;
-      const reader = new FileReader();
-      reader.onload = () => {
-        const text = typeof reader.result === 'string' ? reader.result : '';
-        if (text) {
-          handleWebMoodleImportContent(text);
-        }
-      };
-      reader.onerror = () => {
-        notifyWebOrNative(
-          'File Read Error',
-          'Could not read the selected .ics file.',
-          true
-        );
-      };
-      reader.readAsText(file);
-    };
-    input.click();
-  };
-
-  // Web/PWA: Parse copied WebWork assignment page text (supports ".Open. Due DD.MM.YYYY @ HH:MM" & tables)
-  const handleWebWebworkImportContent = async (rawContent: string) => {
-    const selectedGroup = webworkWebCourseKey
-      ? activeCourseItems.find((c) => c.relationKey === webworkWebCourseKey)
-      : undefined;
-    const courseOverride: WebworkCourseOverride | null = selectedGroup
-      ? {
-          relationKey: selectedGroup.relationKey,
-          courseId: selectedGroup.courseId,
-          courseTitle: selectedGroup.title,
-        }
-      : null;
-
-    const syncedTasks = parseWebworkTextInput(
-      rawContent,
-      eventsRef.current,
-      catalogRef.current,
-      courseOverride
-    );
-
-    if (syncedTasks.length === 0) {
-      notifyWebOrNative(
-        'No Open WebWork Assignments Found',
-        'Make sure you copied the WebWork assignments page (e.g. "Open Assignments", "Open. Due DD.MM.YYYY @ HH:MM" or "Open, closes ...").',
-        true
-      );
-      return;
-    }
-
-    setWebSyncFeedback(null);
-    setWebworkWebPasteText('');
-    setWebworkWebDropdownOpen(false);
-    setWebworkModalVisible(false);
-    await applySyncedTasks(syncedTasks, 'Webwork', true);
-  };
-
-  // WebView Moodle Task Sync Handlers (Native)
+  // WebView Moodle Task Sync Handlers (Native Mobile)
   const handleMoodleNavigationStateChange = (navState: WebViewNavigation) => {
     const url = navState.url || '';
     setMoodleCurrentUrl(url);
 
-    // If the user is on a login or SSO URL, keep the WebView interactive and do not extract
+    // Stay interactive on login or SSO pages; do not extract prematurely
     if (isMoodleLoginRedirectUrl(url)) {
       setMoodleSyncing(false);
       return;
@@ -1383,8 +1229,9 @@ export default function App() {
       eventsRef.current,
       catalogRef.current
     );
-    setMoodleModalVisible(false);
     await applySyncedTasks(syncedTasks, 'Moodle', true);
+    setMoodleModalVisible(false);
+    setSettingsModalVisible(false);
   };
 
   // Non-blocking Toast helper (native ToastAndroid on Android + floating in-app toast banner)
@@ -1537,8 +1384,9 @@ export default function App() {
     }
 
     await applySyncedTasks(syncedTasks, 'Webwork', true);
-    // Close the Webwork WebView modal ONLY after tasks are extracted and saved
+    // Close the Webwork WebView modal & settings ONLY after tasks are extracted and saved
     setWebworkModalVisible(false);
+    setSettingsModalVisible(false);
   };
 
   // Feature 6: PWA-Compatible Schedule Export/Import via Clipboard & TextInput
@@ -2283,35 +2131,68 @@ export default function App() {
                 </Text>
                 <View style={styles.settingsGroupBox}>
                   <TouchableOpacity
-                    style={styles.settingsOptionRow}
+                    style={[
+                      styles.settingsOptionRow,
+                      Platform.OS === 'web' && { opacity: 0.7 },
+                    ]}
                     onPress={() => {
                       setSettingsModalVisible(false);
+                      if (Platform.OS === 'web') {
+                        openWebOnlyUrl(MOODLE_LOGIN_URL);
+                        showToastNotification(
+                          'Automated WebView sync runs in the mobile app — opened Moodle in browser.',
+                          'warning'
+                        );
+                        return;
+                      }
                       setMoodleSyncing(false);
-                      setWebSyncFeedback(null);
-                      setMoodleWebPasteText('');
                       setMoodleCurrentUrl(MOODLE_LOGIN_URL);
                       setMoodleModalVisible(true);
                     }}
                   >
-                    <Text style={styles.settingsOptionText}>🎓 Sync Moodle</Text>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.settingsOptionText}>
+                        🎓 Sync Moodle
+                      </Text>
+                      {Platform.OS === 'web' && (
+                        <Text style={styles.settingsOptionSubText}>
+                          Mobile WebView only • Tap to open Moodle in browser
+                        </Text>
+                      )}
+                    </View>
                     <Text style={styles.settingsOptionChevron}>›</Text>
                   </TouchableOpacity>
 
                   <TouchableOpacity
-                    style={styles.settingsOptionRow}
+                    style={[
+                      styles.settingsOptionRow,
+                      Platform.OS === 'web' && { opacity: 0.7 },
+                    ]}
                     onPress={() => {
                       setSettingsModalVisible(false);
+                      if (Platform.OS === 'web') {
+                        openWebOnlyUrl(WEBWORK_LOGIN_URL);
+                        showToastNotification(
+                          'Automated WebView sync runs in the mobile app — opened Moodle in browser.',
+                          'warning'
+                        );
+                        return;
+                      }
                       setWebworkSyncing(false);
-                      setWebSyncFeedback(null);
-                      setWebworkWebPasteText('');
-                      setWebworkWebDropdownOpen(false);
                       setWebworkCurrentUrl(WEBWORK_LOGIN_URL);
                       setWebworkModalVisible(true);
                     }}
                   >
-                    <Text style={styles.settingsOptionText}>
-                      💻 Sync Webwork
-                    </Text>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.settingsOptionText}>
+                        💻 Sync Webwork
+                      </Text>
+                      {Platform.OS === 'web' && (
+                        <Text style={styles.settingsOptionSubText}>
+                          Mobile WebView only • Tap to open Moodle in browser
+                        </Text>
+                      )}
+                    </View>
                     <Text style={styles.settingsOptionChevron}>›</Text>
                   </TouchableOpacity>
 
@@ -4177,7 +4058,7 @@ export default function App() {
           </View>
         </Modal>
 
-        {/* MODAL 9: SMART WEBVIEW (NATIVE) / .ICS & TEXT SYNC (WEB) FOR MOODLE */}
+        {/* MODAL 9: SMART WEBVIEW MOODLE TASK SYNC (MOBILE) / WINDOW.OPEN FALLBACK (WEB) */}
         <Modal
           visible={moodleModalVisible}
           animationType="slide"
@@ -4194,40 +4075,27 @@ export default function App() {
                     🎓 Technion Moodle Task Sync
                   </Text>
                   <Text style={styles.moodleHeaderSub} numberOfLines={1}>
-                    {Platform.OS === 'web'
-                      ? 'Web / PWA Sync — Import .ics calendar file or Upcoming Events text'
-                      : moodleSyncing
+                    {moodleSyncing
                       ? 'Extracting upcoming assignments from Moodle calendar...'
                       : moodleCurrentUrl}
                   </Text>
                 </View>
 
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                  <TouchableOpacity
-                    style={[styles.btn, { backgroundColor: '#0284C7' }]}
-                    onPress={async () => {
-                      if (Platform.OS === 'web') {
-                        if (moodleWebPasteText.trim()) {
-                          await handleWebMoodleImportContent(moodleWebPasteText);
-                        } else {
-                          const pasted = await handlePasteFromClipboard(
-                            setMoodleWebPasteText
-                          );
-                          if (pasted.trim()) {
-                            await handleWebMoodleImportContent(pasted);
-                          }
-                        }
-                        return;
-                      }
-                      moodleWebViewRef.current?.injectJavaScript(`
-                        window.__meatSpoonManualMoodleSync = true;
-                        window.__meatSpoonMoodleSyncRunning = false;
-                        ${MOODLE_INJECTED_SYNC_SCRIPT}
-                      `);
-                    }}
-                  >
-                    <Text style={styles.btnText}>Sync Now</Text>
-                  </TouchableOpacity>
+                  {Platform.OS !== 'web' && (
+                    <TouchableOpacity
+                      style={[styles.btn, { backgroundColor: '#0284C7' }]}
+                      onPress={() => {
+                        moodleWebViewRef.current?.injectJavaScript(`
+                          window.__meatSpoonManualMoodleSync = true;
+                          window.__meatSpoonMoodleSyncRunning = false;
+                          ${MOODLE_INJECTED_SYNC_SCRIPT}
+                        `);
+                      }}
+                    >
+                      <Text style={styles.btnText}>Sync Now</Text>
+                    </TouchableOpacity>
+                  )}
 
                   <TouchableOpacity onPress={() => setMoodleModalVisible(false)}>
                     <Text style={styles.closeText}>Close</Text>
@@ -4236,111 +4104,20 @@ export default function App() {
               </View>
 
               {Platform.OS === 'web' ? (
-                <ScrollView
-                  style={{ flex: 1 }}
-                  contentContainerStyle={styles.webSyncScrollContent}
-                >
-                  {webSyncFeedback && (
-                    <View
-                      style={[
-                        styles.webSyncFeedbackBox,
-                        webSyncFeedback.isError
-                          ? styles.webSyncFeedbackError
-                          : styles.webSyncFeedbackOk,
-                      ]}
-                    >
-                      <Text style={styles.webSyncFeedbackText}>
-                        {webSyncFeedback.message}
-                      </Text>
-                    </View>
-                  )}
-
-                  <View style={styles.webSyncCard}>
-                    <Text style={styles.webSyncCardTitle}>
-                      Step 1: Export or Copy from Technion Moodle
-                    </Text>
-                    <Text style={styles.webSyncCardDesc}>
-                      Browsers block embedded login frames on Moodle, so open Moodle in a new tab using your browser session:
-                      {'\n'}• Fastest: Open Calendar Export ➔ Select "All events" + "Recent & next 60 days" ➔ click "Export" to download icalexport.ics.
-                      {'\n'}• Or open Upcoming Events ➔ press Ctrl+A then Ctrl+C to copy your tasks.
-                    </Text>
-                    <View style={styles.webSyncBtnRow}>
-                      <TouchableOpacity
-                        style={[styles.webSyncActionBtn, { backgroundColor: '#0284C7' }]}
-                        onPress={() => openExternalBrowserUrl(MOODLE_CALENDAR_EXPORT_PAGE_URL)}
-                      >
-                        <Text style={styles.webSyncActionBtnText}>
-                          🌐 Open Moodle Export (.ics)
-                        </Text>
-                      </TouchableOpacity>
-
-                      <TouchableOpacity
-                        style={[styles.webSyncActionBtn, { backgroundColor: '#2563EB' }]}
-                        onPress={() => openExternalBrowserUrl(MOODLE_UPCOMING_EVENTS_URL)}
-                      >
-                        <Text style={styles.webSyncActionBtnText}>
-                          📅 Open Upcoming Events
-                        </Text>
-                      </TouchableOpacity>
-                    </View>
-                  </View>
-
-                  <View style={styles.webSyncCard}>
-                    <Text style={styles.webSyncCardTitle}>
-                      Step 2A: Upload Downloaded icalexport.ics File
-                    </Text>
-                    <Text style={styles.webSyncCardDesc}>
-                      Imports all deadlines, descriptions, links, and course numbers directly in your browser.
-                    </Text>
-                    <TouchableOpacity
-                      style={[styles.webSyncPrimaryBtn, { backgroundColor: '#059669' }]}
-                      onPress={handlePickMoodleIcsFileOnWeb}
-                    >
-                      <Text style={styles.webSyncPrimaryBtnText}>
-                        📁 Choose icalexport.ics File
-                      </Text>
-                    </TouchableOpacity>
-                  </View>
-
-                  <View style={styles.webSyncCard}>
-                    <View style={styles.webSyncRowBetween}>
-                      <Text style={styles.webSyncCardTitle}>
-                        Step 2B: Or Paste .ics / Upcoming Events Text
-                      </Text>
-                      <TouchableOpacity
-                        style={styles.webSyncSmallBtn}
-                        onPress={() => handlePasteFromClipboard(setMoodleWebPasteText)}
-                      >
-                        <Text style={styles.webSyncSmallBtnText}>📋 Paste Clipboard</Text>
-                      </TouchableOpacity>
-                    </View>
-                    <TextInput
-                      style={styles.webSyncTextInput}
-                      multiline
-                      placeholder="Paste raw icalexport.ics content or copied text from Moodle Upcoming Events (Ctrl+V)..."
-                      placeholderTextColor="#6B7280"
-                      value={moodleWebPasteText}
-                      onChangeText={setMoodleWebPasteText}
-                      autoCapitalize="none"
-                      autoCorrect={false}
-                    />
-                    <TouchableOpacity
-                      style={[
-                        styles.webSyncPrimaryBtn,
-                        {
-                          backgroundColor: moodleWebPasteText.trim()
-                            ? '#0284C7'
-                            : '#374151',
-                        },
-                      ]}
-                      onPress={() => handleWebMoodleImportContent(moodleWebPasteText)}
-                    >
-                      <Text style={styles.webSyncPrimaryBtnText}>
-                        🔄 Extract & Sync Pasted Moodle Tasks
-                      </Text>
-                    </TouchableOpacity>
-                  </View>
-                </ScrollView>
+                <View style={styles.webSyncDisabledContainer}>
+                  <Text style={styles.webSyncDisabledTitle}>
+                    Mobile WebView Sync Only
+                  </Text>
+                  <Text style={styles.webSyncDisabledText}>
+                    Automated in-app Moodle login & background task sync uses a native WebView and is only supported on Android & iOS mobile devices.
+                  </Text>
+                  <TouchableOpacity
+                    style={[styles.btn, { backgroundColor: '#0284C7', paddingHorizontal: 16, paddingVertical: 10, marginTop: 14 }]}
+                    onPress={() => openWebOnlyUrl(MOODLE_LOGIN_URL)}
+                  >
+                    <Text style={styles.btnText}>🌐 Open Moodle in Browser</Text>
+                  </TouchableOpacity>
+                </View>
               ) : (
                 <>
                   {moodleSyncing && (
@@ -4364,8 +4141,34 @@ export default function App() {
                     incognito={false}
                     saveFormDataDisabled={false}
                     keyboardDisplayRequiresUserAction={false}
+                    setSupportMultipleWindows={false}
+                    javaScriptCanOpenWindowsAutomatically={false}
+                    originWhitelist={['https://*', 'http://*']}
+                    onShouldStartLoadWithRequest={(req) => {
+                      const target = (req?.url || '').toLowerCase();
+                      return (
+                        target.startsWith('https://') ||
+                        target.startsWith('http://') ||
+                        target === 'about:blank'
+                      );
+                    }}
+                    onOpenWindow={(evt) => {
+                      const targetUrl = evt?.nativeEvent?.targetUrl;
+                      if (targetUrl && /^https?:\/\//i.test(targetUrl)) {
+                        moodleWebViewRef.current?.injectJavaScript(
+                          `window.location.href = ${JSON.stringify(targetUrl)}; true;`
+                        );
+                      }
+                    }}
                     injectedJavaScript={MOODLE_INJECTED_SYNC_SCRIPT}
                     onNavigationStateChange={handleMoodleNavigationStateChange}
+                    onLoadEnd={() => {
+                      if (isMoodleAuthenticatedUrl(moodleCurrentUrl)) {
+                        moodleWebViewRef.current?.injectJavaScript(
+                          MOODLE_INJECTED_SYNC_SCRIPT
+                        );
+                      }
+                    }}
                     onMessage={handleMoodleWebViewMessage}
                   />
                 </>
@@ -4374,7 +4177,7 @@ export default function App() {
           </SafeAreaProvider>
         </Modal>
 
-        {/* MODAL 10: SMART WEBVIEW (NATIVE) / CLIPBOARD & TEXT SYNC (WEB) FOR WEBWORK */}
+        {/* MODAL 10: SMART WEBVIEW TECHNION WEBWORK TASK SYNC (MOBILE) / WINDOW.OPEN FALLBACK (WEB) */}
         <Modal
           visible={webworkModalVisible}
           animationType="slide"
@@ -4391,41 +4194,28 @@ export default function App() {
                     💻 Technion Webwork Task Sync
                   </Text>
                   <Text style={styles.moodleHeaderSub} numberOfLines={1}>
-                    {Platform.OS === 'web'
-                      ? 'Web / PWA Sync — Copy & paste open assignments from Webwork'
-                      : webworkSyncing
+                    {webworkSyncing
                       ? 'Scanning open Webwork homework sets & due dates...'
                       : webworkCurrentUrl}
                   </Text>
                 </View>
 
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                  <TouchableOpacity
-                    style={[styles.btn, { backgroundColor: '#7C3AED' }]}
-                    onPress={async () => {
-                      if (Platform.OS === 'web') {
-                        if (webworkWebPasteText.trim()) {
-                          await handleWebWebworkImportContent(webworkWebPasteText);
-                        } else {
-                          const pasted = await handlePasteFromClipboard(
-                            setWebworkWebPasteText
-                          );
-                          if (pasted.trim()) {
-                            await handleWebWebworkImportContent(pasted);
-                          }
-                        }
-                        return;
-                      }
-                      setWebworkSyncing(true);
-                      webworkWebViewRef.current?.injectJavaScript(`
-                        window.__meatSpoonForceWebworkScan = true;
-                        window.__meatSpoonWebworkSyncRunning = false;
-                        ${WEBWORK_INJECTED_SYNC_SCRIPT}
-                      `);
-                    }}
-                  >
-                    <Text style={styles.btnText}>Sync Now</Text>
-                  </TouchableOpacity>
+                  {Platform.OS !== 'web' && (
+                    <TouchableOpacity
+                      style={[styles.btn, { backgroundColor: '#7C3AED' }]}
+                      onPress={() => {
+                        setWebworkSyncing(true);
+                        webworkWebViewRef.current?.injectJavaScript(`
+                          window.__meatSpoonForceWebworkScan = true;
+                          window.__meatSpoonWebworkSyncRunning = false;
+                          ${WEBWORK_INJECTED_SYNC_SCRIPT}
+                        `);
+                      }}
+                    >
+                      <Text style={styles.btnText}>Sync Now</Text>
+                    </TouchableOpacity>
+                  )}
 
                   <TouchableOpacity onPress={() => setWebworkModalVisible(false)}>
                     <Text style={styles.closeText}>Close</Text>
@@ -4434,148 +4224,20 @@ export default function App() {
               </View>
 
               {Platform.OS === 'web' ? (
-                <ScrollView
-                  style={{ flex: 1 }}
-                  contentContainerStyle={styles.webSyncScrollContent}
-                >
-                  {webSyncFeedback && (
-                    <View
-                      style={[
-                        styles.webSyncFeedbackBox,
-                        webSyncFeedback.isError
-                          ? styles.webSyncFeedbackError
-                          : styles.webSyncFeedbackOk,
-                      ]}
-                    >
-                      <Text style={styles.webSyncFeedbackText}>
-                        {webSyncFeedback.message}
-                      </Text>
-                    </View>
-                  )}
-
-                  <View style={styles.webSyncCard}>
-                    <Text style={styles.webSyncCardTitle}>
-                      Step 1: Open Your Course's WebWork Page
-                    </Text>
-                    <Text style={styles.webSyncCardDesc}>
-                      Open Moodle, go into your Math/WebWork course, click its WebWork link, then press Ctrl+A and Ctrl+C on the WebWork assignments page.
-                    </Text>
-                    <TouchableOpacity
-                      style={[styles.webSyncPrimaryBtn, { backgroundColor: '#7C3AED' }]}
-                      onPress={() => openExternalBrowserUrl(WEBWORK_LOGIN_URL)}
-                    >
-                      <Text style={styles.webSyncPrimaryBtnText}>
-                        🌐 Open Moodle Dashboard (➔ Course ➔ WebWork)
-                      </Text>
-                    </TouchableOpacity>
-                  </View>
-
-                  <View style={styles.webSyncCard}>
-                    <Text style={styles.webSyncCardTitle}>
-                      Step 2: Link Imported Tasks to a Course (Optional)
-                    </Text>
-                    <TouchableOpacity
-                      style={styles.webSyncCoursePicker}
-                      onPress={() => setWebworkWebDropdownOpen((prev) => !prev)}
-                    >
-                      <Text style={styles.webSyncCoursePickerText} numberOfLines={1}>
-                        {(() => {
-                          if (!webworkWebCourseKey) {
-                            return '✨ Auto-detect course from pasted text';
-                          }
-                          const found = activeCourseItems.find(
-                            (c) => c.relationKey === webworkWebCourseKey
-                          );
-                          return found
-                            ? `${found.courseId ? `${found.courseId} — ` : ''}${found.title}`
-                            : '✨ Auto-detect course from pasted text';
-                        })()}
-                      </Text>
-                      <Text style={styles.webSyncCoursePickerArrow}>
-                        {webworkWebDropdownOpen ? '▲' : '▼'}
-                      </Text>
-                    </TouchableOpacity>
-
-                    {webworkWebDropdownOpen && (
-                      <View style={styles.webSyncDropdownList}>
-                        <TouchableOpacity
-                          style={styles.webSyncDropdownItem}
-                          onPress={() => {
-                            setWebworkWebCourseKey(null);
-                            setWebworkWebDropdownOpen(false);
-                          }}
-                        >
-                          <Text style={styles.webSyncDropdownItemText}>
-                            ✨ Auto-detect course from pasted text
-                          </Text>
-                        </TouchableOpacity>
-                        {activeCourseItems.map((item) => (
-                          <TouchableOpacity
-                            key={item.relationKey}
-                            style={styles.webSyncDropdownItem}
-                            onPress={() => {
-                              setWebworkWebCourseKey(item.relationKey);
-                              setWebworkWebDropdownOpen(false);
-                            }}
-                          >
-                            <View
-                              style={[
-                                styles.dropdownColorDot,
-                                { backgroundColor: item.color },
-                              ]}
-                            />
-                            <Text
-                              style={styles.webSyncDropdownItemText}
-                              numberOfLines={1}
-                            >
-                              {item.courseId ? `${item.courseId} — ` : ''}
-                              {item.title}
-                            </Text>
-                          </TouchableOpacity>
-                        ))}
-                      </View>
-                    )}
-
-                    <View style={[styles.webSyncRowBetween, { marginTop: 12 }]}>
-                      <Text style={styles.webSyncCardTitle}>
-                        Step 3: Paste Copied WebWork Page Text
-                      </Text>
-                      <TouchableOpacity
-                        style={styles.webSyncSmallBtn}
-                        onPress={() => handlePasteFromClipboard(setWebworkWebPasteText)}
-                      >
-                        <Text style={styles.webSyncSmallBtnText}>📋 Paste Clipboard</Text>
-                      </TouchableOpacity>
-                    </View>
-                    <TextInput
-                      style={styles.webSyncTextInput}
-                      multiline
-                      placeholder={'Paste copied WebWork page here, e.g.:\nOpen Assignments\nHW02-Complex\n.Open. Due 19.11.2026 @ 23:59'}
-                      placeholderTextColor="#6B7280"
-                      value={webworkWebPasteText}
-                      onChangeText={setWebworkWebPasteText}
-                      autoCapitalize="none"
-                      autoCorrect={false}
-                    />
-                    <TouchableOpacity
-                      style={[
-                        styles.webSyncPrimaryBtn,
-                        {
-                          backgroundColor: webworkWebPasteText.trim()
-                            ? '#7C3AED'
-                            : '#374151',
-                        },
-                      ]}
-                      onPress={() =>
-                        handleWebWebworkImportContent(webworkWebPasteText)
-                      }
-                    >
-                      <Text style={styles.webSyncPrimaryBtnText}>
-                        ✅ Extract & Sync Open WebWork Assignments
-                      </Text>
-                    </TouchableOpacity>
-                  </View>
-                </ScrollView>
+                <View style={styles.webSyncDisabledContainer}>
+                  <Text style={styles.webSyncDisabledTitle}>
+                    Mobile WebView Sync Only
+                  </Text>
+                  <Text style={styles.webSyncDisabledText}>
+                    Automated in-app WebWork login & scraping uses a native WebView and is only supported on Android & iOS mobile devices.
+                  </Text>
+                  <TouchableOpacity
+                    style={[styles.btn, { backgroundColor: '#7C3AED', paddingHorizontal: 16, paddingVertical: 10, marginTop: 14 }]}
+                    onPress={() => openWebOnlyUrl(WEBWORK_LOGIN_URL)}
+                  >
+                    <Text style={styles.btnText}>🌐 Open Moodle in Browser</Text>
+                  </TouchableOpacity>
+                </View>
               ) : (
                 <>
                   {webworkSyncing ? (
@@ -4616,7 +4278,38 @@ export default function App() {
                     saveFormDataDisabled={false}
                     keyboardDisplayRequiresUserAction={false}
                     setSupportMultipleWindows={false}
+                    javaScriptCanOpenWindowsAutomatically={false}
+                    originWhitelist={['https://*', 'http://*']}
+                    onShouldStartLoadWithRequest={(req) => {
+                      const target = (req?.url || '').toLowerCase();
+                      return (
+                        target.startsWith('https://') ||
+                        target.startsWith('http://') ||
+                        target === 'about:blank'
+                      );
+                    }}
+                    onOpenWindow={(evt) => {
+                      const targetUrl = evt?.nativeEvent?.targetUrl;
+                      if (targetUrl && /^https?:\/\//i.test(targetUrl)) {
+                        webworkWebViewRef.current?.injectJavaScript(
+                          `window.location.href = ${JSON.stringify(targetUrl)}; true;`
+                        );
+                      }
+                    }}
                     onNavigationStateChange={handleWebworkNavigationStateChange}
+                    onLoadEnd={() => {
+                      const lower = webworkCurrentUrl.toLowerCase();
+                      if (lower.includes('moodle.technion')) {
+                        webworkWebViewRef.current?.injectJavaScript(
+                          WEBWORK_MOODLE_NAVIGATION_HELPER_SCRIPT
+                        );
+                      } else if (isWebworkAuthenticatedUrl(webworkCurrentUrl)) {
+                        setWebworkSyncing(true);
+                        webworkWebViewRef.current?.injectJavaScript(
+                          WEBWORK_INJECTED_SYNC_SCRIPT
+                        );
+                      }
+                    }}
                     onMessage={handleWebworkWebViewMessage}
                   />
                 </>
@@ -4650,19 +4343,30 @@ export default function App() {
           </View>
         )}
 
-        {/* HIDDEN 0x0 BACKGROUND WEBVIEW FOR SILENT MOODLE SYNC ON APP MOUNT (NATIVE ONLY) */}
+        {/* HIDDEN 0x0 BACKGROUND WEBVIEW FOR SILENT MOODLE SYNC ON APP MOUNT (MOBILE NATIVE ONLY) */}
         {Platform.OS !== 'web' && bgMoodleSyncActive && !moodleModalVisible && (
           <View style={styles.hiddenBgWebViewContainer} pointerEvents="none">
             <WebView<{}>
               ref={bgMoodleWebViewRef}
-              source={{ uri: MOODLE_CALENDAR_EXPORT_URL }}
+              source={{ uri: MOODLE_CALENDAR_EXPORT_PAGE_URL }}
               style={{ width: 0, height: 0, opacity: 0 }}
               javaScriptEnabled
               domStorageEnabled
               sharedCookiesEnabled
               thirdPartyCookiesEnabled
+              cacheEnabled
+              incognito={false}
+              setSupportMultipleWindows={false}
+              originWhitelist={['https://*', 'http://*']}
               injectedJavaScript={MOODLE_BG_INJECTED_SYNC_SCRIPT}
               onNavigationStateChange={handleBgMoodleNavigationStateChange}
+              onLoadEnd={() => {
+                if (!bgMoodleHandledRef.current) {
+                  bgMoodleWebViewRef.current?.injectJavaScript(
+                    MOODLE_BG_INJECTED_SYNC_SCRIPT
+                  );
+                }
+              }}
               onMessage={handleBgMoodleMessage}
               onError={triggerBgMoodleExpiredNotice}
               onHttpError={(evt) => {
@@ -4671,6 +4375,7 @@ export default function App() {
                 if (
                   status === 401 ||
                   status === 403 ||
+                  url.includes('export.php') ||
                   url.includes('export_execute')
                 ) {
                   triggerBgMoodleExpiredNotice();
@@ -5663,153 +5368,29 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
   },
-  webSyncScrollContent: {
-    padding: 16,
-    gap: 14,
-  },
-  webSyncCard: {
-    backgroundColor: '#1F2937',
-    borderWidth: 1,
-    borderColor: '#374151',
-    borderRadius: 14,
-    padding: 16,
-  },
-  webSyncCardTitle: {
-    color: '#F9FAFB',
-    fontSize: 15,
-    fontWeight: '800',
-    marginBottom: 6,
-  },
-  webSyncCardDesc: {
-    color: '#D1D5DB',
-    fontSize: 12.5,
-    lineHeight: 19,
-    marginBottom: 12,
-  },
-  webSyncBtnRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 10,
-  },
-  webSyncActionBtn: {
-    flex: 1,
-    minWidth: 180,
-    paddingVertical: 11,
-    paddingHorizontal: 14,
-    borderRadius: 10,
-    alignItems: 'center',
-  },
-  webSyncActionBtnText: {
-    color: '#FFFFFF',
-    fontSize: 13,
-    fontWeight: '700',
-  },
-  webSyncPrimaryBtn: {
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    borderRadius: 10,
-    alignItems: 'center',
-  },
-  webSyncPrimaryBtnText: {
-    color: '#FFFFFF',
-    fontSize: 14,
-    fontWeight: '800',
-  },
-  webSyncRowBetween: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 8,
-    marginBottom: 8,
-  },
-  webSyncSmallBtn: {
-    backgroundColor: '#374151',
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-  },
-  webSyncSmallBtnText: {
-    color: '#E5E7EB',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  webSyncTextInput: {
-    backgroundColor: '#111827',
-    borderWidth: 1,
-    borderColor: '#374151',
-    borderRadius: 10,
-    color: '#F9FAFB',
-    fontSize: 12.5,
-    minHeight: 130,
-    maxHeight: 220,
-    padding: 12,
-    textAlignVertical: 'top',
-    marginBottom: 12,
-  },
-  webSyncCoursePicker: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: '#111827',
-    borderWidth: 1,
-    borderColor: '#374151',
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    marginBottom: 6,
-  },
-  webSyncCoursePickerText: {
-    color: '#F9FAFB',
-    fontSize: 13,
-    fontWeight: '600',
-    flex: 1,
-    marginRight: 8,
-  },
-  webSyncCoursePickerArrow: {
+  settingsOptionSubText: {
     color: '#9CA3AF',
-    fontSize: 12,
+    fontSize: 11,
+    marginTop: 2,
   },
-  webSyncDropdownList: {
-    backgroundColor: '#111827',
-    borderWidth: 1,
-    borderColor: '#374151',
-    borderRadius: 10,
-    maxHeight: 160,
-    overflow: 'hidden',
-    marginBottom: 4,
-  },
-  webSyncDropdownItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: '#1F2937',
-  },
-  webSyncDropdownItemText: {
-    color: '#E5E7EB',
-    fontSize: 13,
+  webSyncDisabledContainer: {
     flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
   },
-  webSyncFeedbackBox: {
-    borderRadius: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderWidth: 1,
+  webSyncDisabledTitle: {
+    color: '#F9FAFB',
+    fontSize: 17,
+    fontWeight: '800',
+    marginBottom: 8,
+    textAlign: 'center',
   },
-  webSyncFeedbackError: {
-    backgroundColor: '#7F1D1D',
-    borderColor: '#EF4444',
-  },
-  webSyncFeedbackOk: {
-    backgroundColor: '#065F46',
-    borderColor: '#10B981',
-  },
-  webSyncFeedbackText: {
-    color: '#FFFFFF',
-    fontSize: 12.5,
-    fontWeight: '700',
+  webSyncDisabledText: {
+    color: '#9CA3AF',
+    fontSize: 13.5,
+    lineHeight: 20,
+    textAlign: 'center',
   },
   sectionLabel: { fontSize: 13, fontWeight: '600', marginTop: 10, marginBottom: 6 },
   colorRow: { flexDirection: 'row', gap: 10, marginBottom: 14 },

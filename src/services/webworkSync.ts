@@ -316,7 +316,7 @@ export const WEBWORK_INJECTED_SYNC_SCRIPT = `
     var attempts = 0;
     var pollId = setInterval(function() {
       attempts++;
-      if (window.__meatSpoonWebworkSyncRunning || attempts > 12) {
+      if (attempts > 15) {
         clearInterval(pollId);
         window.__meatSpoonWebworkPollStarted = false;
         return;
@@ -324,6 +324,7 @@ export const WEBWORK_INJECTED_SYNC_SCRIPT = `
       var polledSets = extractSetsFromDocument(document, window.location.href);
       if (polledSets.length > 0) {
         clearInterval(pollId);
+        window.__meatSpoonWebworkPollStarted = false;
         window.__meatSpoonWebworkSyncRunning = true;
         window.__meatSpoonForceWebworkScan = false;
         postTasksToApp(polledSets, false);
@@ -331,17 +332,25 @@ export const WEBWORK_INJECTED_SYNC_SCRIPT = `
     }, 700);
   }
 
-  // If on a logged-in Webwork course-selection page with links to /webwork2/<course>/,
-  // crawl linked course pages when requested or when on the root /webwork2/ index
-  var courseLinks = Array.prototype.slice.call(document.querySelectorAll('a[href*="/webwork2/"]'));
-  if (window.__meatSpoonForceWebworkScan || courseLinks.length > 0) {
+  // Only crawl course links when explicitly triggered via "Sync Now" OR on the top-level course index (/webwork2/)
+  var isTopCourseIndex = /\\/webwork2\\/?(?:\\?.*)?$/i.test(window.location.href);
+  var rawCourseLinks = Array.prototype.slice.call(document.querySelectorAll('a[href*="/webwork2/"]'));
+  var topCourseLinks = [];
+  for (var cl = 0; cl < rawCourseLinks.length; cl++) {
+    var chref = rawCourseLinks[cl].href || '';
+    if (/\\/webwork2\\/[^/?#]+\\/?$/i.test(chref) && !/logout|options|grades|Achievements/i.test(chref)) {
+      topCourseLinks.push(rawCourseLinks[cl]);
+    }
+  }
+  if (window.__meatSpoonForceWebworkScan || (isTopCourseIndex && topCourseLinks.length > 0)) {
     var isManual = !!window.__meatSpoonForceWebworkScan;
+    var linksToScan = isManual ? rawCourseLinks : topCourseLinks;
     window.__meatSpoonWebworkSyncRunning = true;
     (async function() {
       var allExtracted = [];
       var visited = {};
-      for (var j = 0; j < courseLinks.length && j < 12; j++) {
-        var href = courseLinks[j].href;
+      for (var j = 0; j < linksToScan.length && j < 12; j++) {
+        var href = linksToScan[j].href;
         if (!href || visited[href] || href === window.location.href) continue;
         if (/logout|options|grades|Achievements/i.test(href)) continue;
         visited[href] = true;
@@ -521,134 +530,4 @@ function parseWebworkDeadline(text: string): Date | null {
   }
 
   return null;
-}
-
-export interface WebworkCourseOverride {
-  relationKey: string;
-  courseId?: string;
-  courseTitle: string;
-}
-
-function cleanWebworkTitleText(raw: string): string {
-  return raw
-    .replace(/\.?\s*Open[.,]?\s*(?:Due|Closes).*$/i, '')
-    .replace(/^[\s•·:.-]+|[\s•·:.-]+$/g, '')
-    .replace(/_/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-/**
- * Parses WebWork assignments for Web/PWA from:
- * 1. JSON payload (`WEBWORK_TASKS_DATA`)
- * 2. Copied plain text from Technion WebWork responsive accordion layout
- *    (e.g., "Open Assignments", "HW02-Complex", ".Open. Due 19.11.2026 @ 23:59")
- * 3. Copied classic WebWork table rows ("Set01 Open, closes 12/25/2026 at 11:59pm")
- */
-export function parseWebworkTextInput(
-  rawInput: string,
-  events: ScheduleEvent[],
-  catalog: CourseCatalogItem[],
-  courseOverride?: WebworkCourseOverride | null
-): CourseTask[] {
-  const trimmed = (rawInput || '').trim();
-  if (!trimmed) return [];
-
-  const applyCourseOverride = (items: CourseTask[]): CourseTask[] => {
-    if (!courseOverride) return items;
-    return items.map((t) => ({
-      ...t,
-      relationKey: courseOverride.relationKey,
-      courseId: courseOverride.courseId,
-      courseTitle: courseOverride.courseTitle,
-      groupTitle: courseOverride.courseTitle,
-    }));
-  };
-
-  if (trimmed.startsWith('{')) {
-    const fromJson = parseWebworkSyncPayload(trimmed, events, catalog);
-    if (fromJson.length > 0) return applyCourseOverride(fromJson);
-  }
-
-  const lines = trimmed
-    .split(/\r?\n/)
-    .map((l) => l.replace(/\s+/g, ' ').trim())
-    .filter(Boolean);
-
-  const extractedSets: RawWebworkSet[] = [];
-  const headerContext: string[] = [];
-  let inClosedSection = false;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    // Stop or skip if inside the Closed Assignments section
-    if (/^closed\s+assignments/i.test(line) || /^past\s+assignments/i.test(line)) {
-      inClosedSection = true;
-      continue;
-    }
-    if (/^open\s+assignments/i.test(line)) {
-      inClosedSection = false;
-      continue;
-    }
-
-    if (i < 12) {
-      headerContext.push(line);
-    }
-
-    const hasOpenDuePattern =
-      /Open[.,]?\s*(?:Due|Closes)/i.test(line) ||
-      (!inClosedSection && /\b(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\b/.test(line) && !/\bclosed\b|סגור|נסגר/i.test(line));
-
-    if (!hasOpenDuePattern) continue;
-
-    // Look for date/time on this line, or combine with the next line if copied split across lines
-    let statusLine = line;
-    if (!/\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b|\b\d{4}-\d{1,2}-\d{1,2}\b/.test(statusLine) && i + 1 < lines.length) {
-      statusLine = `${statusLine} ${lines[i + 1]}`;
-    }
-
-    const deadlineDate = parseWebworkDeadline(statusLine);
-    if (!deadlineDate) continue;
-
-    // Assignment title can appear before ".Open. Due" on the same line OR on the immediately preceding line
-    let setName = cleanWebworkTitleText(
-      line.split(/\.?\s*(?:Open[.,]?\s*(?:Due|Closes)|\b(?:19|20)\d{2}-\d{1,2}-\d{1,2}\b|\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b)/i)[0] || ''
-    );
-
-    if (
-      (!setName || /^(open\s+assignments|due|closes)$/i.test(setName)) &&
-      i > 0
-    ) {
-      const prevLine = lines[i - 1];
-      if (
-        prevLine &&
-        !/^open\s+assignments/i.test(prevLine) &&
-        !/^closed\s+assignments/i.test(prevLine) &&
-        !/Open[.,]?\s*(?:Due|Closes)/i.test(prevLine)
-      ) {
-        setName = cleanWebworkTitleText(prevLine);
-      }
-    }
-
-    if (!setName || /^(name|set name|open assignments|status)$/i.test(setName)) {
-      continue;
-    }
-
-    extractedSets.push({
-      setName,
-      deadlineISO: deadlineDate.toISOString(),
-      statusText: statusLine,
-      courseHint: headerContext.join(' '),
-      url: WEBWORK_LOGIN_URL,
-    });
-  }
-
-  const syntheticPayload = JSON.stringify({
-    type: 'WEBWORK_TASKS_DATA',
-    tasks: extractedSets,
-  });
-  return applyCourseOverride(
-    parseWebworkSyncPayload(syntheticPayload, events, catalog)
-  );
 }
