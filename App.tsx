@@ -23,6 +23,7 @@ import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
+import * as DocumentPicker from 'expo-document-picker';
 import { WebView, WebViewMessageEvent, WebViewNavigation } from 'react-native-webview';
 import {
   ScheduleEvent,
@@ -57,7 +58,6 @@ import {
   isWebworkAuthenticatedUrl,
   parseWebworkSyncPayload,
 } from './src/services/webworkSync';
-import { CourseReviewsSummarySection } from './src/components/CourseReviewsSummarySection';
 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu'];
 // Feature 1: RTL Schedule Layout (Sunday = 0 on the far right, Thursday = 4 on the far left)
@@ -66,7 +66,7 @@ const ASYNC_STORAGE_KEY = '@meatspoon_persisted_state_v1';
 
 const START_HOUR = 8;
 const END_HOUR = 20;
-const DEFAULT_PIXELS_PER_HOUR = 60;
+const DEFAULT_PIXELS_PER_HOUR = 80;
 const MIN_PIXELS_PER_HOUR = 36;
 const MAX_PIXELS_PER_HOUR = 140;
 
@@ -172,6 +172,7 @@ interface LocalBackupPayload {
   hiddenKeys: Record<string, boolean>;
   includedSpecialGroups: Record<string, boolean>;
   autoOpenMoodleLogin?: boolean;
+  moodleIcalUrl?: string;
 }
 
 /**
@@ -470,7 +471,11 @@ export default function App() {
   const [autoOpenMoodleLogin, setAutoOpenMoodleLogin] = useState<boolean>(true);
   const autoOpenMoodleLoginRef = useRef<boolean>(true);
   autoOpenMoodleLoginRef.current = autoOpenMoodleLogin;
-  const [bgMoodleSyncActive, setBgMoodleSyncActive] = useState(true);
+  const [moodleIcalUrl, setMoodleIcalUrl] = useState<string>('');
+  const [moodleWebSyncing, setMoodleWebSyncing] = useState<boolean>(false);
+  const [bgMoodleSyncActive, setBgMoodleSyncActive] = useState<boolean>(
+    () => Platform.OS !== 'web'
+  );
   const bgMoodleWebViewRef = useRef<WebView<{}> | null>(null);
   const bgMoodleHandledRef = useRef(false);
   const [toastBanner, setToastBanner] = useState<{
@@ -573,6 +578,9 @@ export default function App() {
             setAutoOpenMoodleLogin(parsed.autoOpenMoodleLogin);
             autoOpenMoodleLoginRef.current = parsed.autoOpenMoodleLogin;
           }
+          if (typeof parsed.moodleIcalUrl === 'string') {
+            setMoodleIcalUrl(parsed.moodleIcalUrl);
+          }
         }
       } catch (err) {
         console.warn('Failed to load schedule state from AsyncStorage:', err);
@@ -605,6 +613,7 @@ export default function App() {
           hiddenKeys,
           includedSpecialGroups,
           autoOpenMoodleLogin,
+          moodleIcalUrl,
         };
         await AsyncStorage.setItem(ASYNC_STORAGE_KEY, JSON.stringify(payload));
       } catch (err) {
@@ -622,6 +631,7 @@ export default function App() {
     hiddenKeys,
     includedSpecialGroups,
     autoOpenMoodleLogin,
+    moodleIcalUrl,
   ]);
 
   // Automatically sync Cheesefork JS data when opening the Courses or Auto-Builder modal
@@ -1165,36 +1175,44 @@ export default function App() {
       return;
     }
 
-    let newlyAddedCount = 0;
-    setTasks((prev) => {
-      const existingSignatures = new Set(
-        prev.map(
-          (t) =>
-            `${t.title.trim().toLowerCase()}__${Math.floor(
-              new Date(t.deadlineISO).getTime() / 60000
-            )}`
-        )
-      );
-
-      const merged = [...prev];
-      for (const incoming of syncedTasks) {
-        const sig = `${incoming.title.trim().toLowerCase()}__${Math.floor(
-          new Date(incoming.deadlineISO).getTime() / 60000
-        )}`;
-        if (!existingSignatures.has(sig)) {
-          existingSignatures.add(sig);
-          merged.push(incoming);
-          newlyAddedCount += 1;
-        }
-      }
-
-      return merged.sort((a, b) => a.deadlineISO.localeCompare(b.deadlineISO));
-    });
+    const newlyAddedCount = mergeSyncedTasks(syncedTasks);
 
     Alert.alert(
       '🎓 Moodle Sync Successful',
       `Synced ${syncedTasks.length} assignment(s) from Moodle (${newlyAddedCount} new added to your local schedule).`
     );
+  };
+
+  const mergeSyncedTasks = (syncedTasks: CourseTask[]): number => {
+    const buildSig = (t: CourseTask) =>
+      `${t.title.trim().toLowerCase()}__${Math.floor(
+        new Date(t.deadlineISO).getTime() / 60000
+      )}`;
+
+    const currentSignatures = new Set(tasks.map(buildSig));
+    let newlyAddedCount = 0;
+    for (const incoming of syncedTasks) {
+      const sig = buildSig(incoming);
+      if (!currentSignatures.has(sig)) {
+        currentSignatures.add(sig);
+        newlyAddedCount += 1;
+      }
+    }
+
+    setTasks((prev) => {
+      const existingSignatures = new Set(prev.map(buildSig));
+      const merged = [...prev];
+      for (const incoming of syncedTasks) {
+        const sig = buildSig(incoming);
+        if (!existingSignatures.has(sig)) {
+          existingSignatures.add(sig);
+          merged.push(incoming);
+        }
+      }
+      return merged.sort((a, b) => a.deadlineISO.localeCompare(b.deadlineISO));
+    });
+
+    return newlyAddedCount;
   };
 
   // Non-blocking Toast helper (native ToastAndroid on Android + floating in-app toast banner)
@@ -1216,6 +1234,154 @@ export default function App() {
       setToastBanner(null);
       toastTimerRef.current = null;
     }, 4500);
+  };
+
+  // Shared floating toast banner renderer (visible both on main screen and inside Settings modal)
+  const renderFloatingToast = () => {
+    if (!toastBanner) return null;
+    return (
+      <View
+        style={[
+          styles.floatingToastBanner,
+          toastBanner.variant === 'warning'
+            ? styles.floatingToastWarning
+            : styles.floatingToastSuccess,
+        ]}
+      >
+        <Text style={styles.floatingToastText}>{toastBanner.message}</Text>
+        {toastBanner.variant === 'warning' && !settingsModalVisible && (
+          <TouchableOpacity
+            style={styles.floatingToastActionBtn}
+            onPress={() => {
+              setToastBanner(null);
+              setSettingsModalVisible(true);
+            }}
+          >
+            <Text style={styles.floatingToastActionText}>⚙️ הגדרות</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+    );
+  };
+
+  // Shared parser + state merge for Moodle .ics text (used by URL sync and manual .ics upload)
+  const importMoodleIcsText = (
+    icsText: string,
+    source: 'url' | 'file'
+  ): boolean => {
+    if (!icsText || !icsText.includes('BEGIN:VCALENDAR')) {
+      showToastNotification(
+        source === 'file'
+          ? 'Invalid .ics file. Please export your Moodle calendar (.ics) and try again.'
+          : 'Invalid Moodle iCal response. Verify your Moodle iCal Export URL.',
+        'warning'
+      );
+      return false;
+    }
+
+    const syncedTasks = parseMoodleSyncPayload(icsText, events, catalog);
+    if (syncedTasks.length === 0) {
+      showToastNotification(
+        source === 'file'
+          ? 'Moodle .ics imported: 0 upcoming tasks found in file.'
+          : 'Moodle sync complete: 0 upcoming tasks found in iCal feed.',
+        'success'
+      );
+      return true;
+    }
+
+    const newlyAddedCount = mergeSyncedTasks(syncedTasks);
+    showToastNotification(
+      `Synced ${syncedTasks.length} Moodle task(s) (${newlyAddedCount} new added).`,
+      'success'
+    );
+    return true;
+  };
+
+  // Web/PWA fallback: fetch Moodle .ics export URL through CORS proxy and merge tasks
+  const handleWebMoodleIcalSync = async () => {
+    const trimmedUrl = moodleIcalUrl.trim();
+    if (!trimmedUrl) {
+      showToastNotification(
+        'Please paste your Moodle iCal Export URL first.',
+        'warning'
+      );
+      return;
+    }
+
+    if (!/^https?:\/\//i.test(trimmedUrl)) {
+      showToastNotification(
+        'Please enter a valid http/https Moodle iCal Export URL.',
+        'warning'
+      );
+      return;
+    }
+
+    if (moodleWebSyncing) return;
+
+    setSettingsModalVisible(false);
+    setMoodleWebSyncing(true);
+    try {
+      const proxyUrl = `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(
+        trimmedUrl
+      )}`;
+      const response = await fetch(proxyUrl);
+      if (!response.ok) {
+        throw new Error(`Proxy request failed with status ${response.status}`);
+      }
+
+      const icsText = await response.text();
+      importMoodleIcsText(icsText, 'url');
+    } catch (err: any) {
+      console.warn('Web Moodle iCal sync error:', err);
+      showToastNotification(
+        err?.message || 'Failed to sync Moodle iCal URL via CORS proxy.',
+        'warning'
+      );
+    } finally {
+      setMoodleWebSyncing(false);
+    }
+  };
+
+  // Bulletproof fallback: pick a local .ics file and parse directly without fetch/CORS proxy
+  const handleUploadMoodleIcsFile = async () => {
+    if (moodleWebSyncing) return;
+
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: Platform.OS === 'web' ? ['.ics', 'text/calendar'] : '*/*',
+        copyToCacheDirectory: true,
+        multiple: false,
+      });
+
+      if (result.canceled || !result.assets || result.assets.length === 0) {
+        return;
+      }
+
+      setMoodleWebSyncing(true);
+      const asset = result.assets[0];
+      let icsText = '';
+
+      if (asset.file && typeof asset.file.text === 'function') {
+        icsText = await asset.file.text();
+      } else if (asset.uri) {
+        const fileResponse = await fetch(asset.uri);
+        icsText = await fileResponse.text();
+      }
+
+      const imported = importMoodleIcsText(icsText, 'file');
+      if (imported) {
+        setSettingsModalVisible(false);
+      }
+    } catch (err: any) {
+      console.warn('Manual .ics upload error:', err);
+      showToastNotification(
+        err?.message || 'Failed to read selected .ics file.',
+        'warning'
+      );
+    } finally {
+      setMoodleWebSyncing(false);
+    }
   };
 
   // Silent Background Moodle Sync Handlers (runs on mount without blocking UI)
@@ -1430,6 +1596,7 @@ export default function App() {
         hiddenKeys,
         includedSpecialGroups,
         autoOpenMoodleLogin,
+        moodleIcalUrl,
       };
 
       const jsonText = JSON.stringify(payload, null, 2);
@@ -1495,6 +1662,10 @@ export default function App() {
         typeof parsed.autoOpenMoodleLogin === 'boolean'
           ? parsed.autoOpenMoodleLogin
           : autoOpenMoodleLogin;
+      const nextMoodleIcalUrl =
+        typeof parsed.moodleIcalUrl === 'string'
+          ? parsed.moodleIcalUrl
+          : moodleIcalUrl;
 
       setEvents(incomingEvents);
       setTasks(incomingTasks);
@@ -1504,6 +1675,7 @@ export default function App() {
       setIncludedSpecialGroups(nextSpecialGroups);
       setAutoOpenMoodleLogin(nextAutoOpenMoodle);
       autoOpenMoodleLoginRef.current = nextAutoOpenMoodle;
+      setMoodleIcalUrl(nextMoodleIcalUrl);
 
       const restoredPayload: LocalBackupPayload = {
         version: 1,
@@ -1515,6 +1687,7 @@ export default function App() {
         hiddenKeys: nextHiddenKeys,
         includedSpecialGroups: nextSpecialGroups,
         autoOpenMoodleLogin: nextAutoOpenMoodle,
+        moodleIcalUrl: nextMoodleIcalUrl,
       };
       await AsyncStorage.setItem(
         ASYNC_STORAGE_KEY,
@@ -2157,30 +2330,78 @@ export default function App() {
                   ACADEMIC ASSIGNMENTS SYNC
                 </Text>
                 <View style={styles.settingsGroupBox}>
+                  {Platform.OS === 'web' && (
+                    <View style={styles.settingsWebInputContainer}>
+                      <Text style={styles.settingsWebInputLabel}>
+                        Moodle iCal Export URL
+                      </Text>
+                      <TextInput
+                        style={styles.settingsWebInput}
+                        value={moodleIcalUrl}
+                        onChangeText={setMoodleIcalUrl}
+                        placeholder="Paste your Moodle iCal Export URL..."
+                        placeholderTextColor="#6B7280"
+                        autoCapitalize="none"
+                        autoCorrect={false}
+                        keyboardType="url"
+                        selectTextOnFocus
+                      />
+                      <TouchableOpacity
+                        style={styles.settingsWebUploadBtn}
+                        disabled={moodleWebSyncing}
+                        onPress={handleUploadMoodleIcsFile}
+                      >
+                        <Text style={styles.settingsWebUploadBtnText}>
+                          {moodleWebSyncing
+                            ? '⏳ Importing .ics...'
+                            : '📂 Upload .ics File'}
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+                  )}
+
                   <TouchableOpacity
                     style={styles.settingsOptionRow}
+                    disabled={Platform.OS === 'web' && moodleWebSyncing}
                     onPress={() => {
+                      if (Platform.OS === 'web') {
+                        handleWebMoodleIcalSync();
+                        return;
+                      }
                       setSettingsModalVisible(false);
                       setMoodleSyncing(false);
                       setMoodleCurrentUrl(MOODLE_LOGIN_URL);
                       setMoodleModalVisible(true);
                     }}
                   >
-                    <Text style={styles.settingsOptionText}>🎓 Sync Moodle</Text>
+                    <Text style={styles.settingsOptionText}>
+                      {Platform.OS === 'web' && moodleWebSyncing
+                        ? '⏳ Syncing Moodle...'
+                        : '🎓 Sync Moodle'}
+                    </Text>
                     <Text style={styles.settingsOptionChevron}>›</Text>
                   </TouchableOpacity>
 
                   <TouchableOpacity
                     style={styles.settingsOptionRow}
                     onPress={() => {
+                      if (Platform.OS === 'web') {
+                        showToastNotification('Work in progress', 'warning');
+                        return;
+                      }
                       setSettingsModalVisible(false);
                       setWebworkSyncing(false);
                       setWebworkCurrentUrl(WEBWORK_LOGIN_URL);
                       setWebworkModalVisible(true);
                     }}
                   >
-                    <Text style={styles.settingsOptionText}>
-                      💻 Sync Webwork
+                    <Text
+                      style={[
+                        styles.settingsOptionText,
+                        Platform.OS === 'web' && styles.settingsDisabledOptionText,
+                      ]}
+                    >
+                      {Platform.OS === 'web' ? '💻 בעבודה' : '💻 Sync Webwork'}
                     </Text>
                     <Text style={styles.settingsOptionChevron}>›</Text>
                   </TouchableOpacity>
@@ -2277,6 +2498,7 @@ export default function App() {
                 <Text style={styles.settingsCloseBtnText}>Close</Text>
               </TouchableOpacity>
             </View>
+            {settingsModalVisible && renderFloatingToast()}
           </View>
         </Modal>
 
@@ -2880,10 +3102,7 @@ export default function App() {
                           </Text>
                         </TouchableOpacity>
 
-                        {/* Course Reviews AI Summary Accordion ("✨ סיכום ביקורות AI") */}
-                        <CourseReviewsSummarySection
-                          courseId={course.courseId}
-                        />
+                        
 
                         {isExpanded &&
                           (course.groups.length === 0 ? (
@@ -4104,22 +4323,24 @@ export default function App() {
                 </View>
               )}
 
-              <WebView<{}>
-                ref={moodleWebViewRef}
-                source={{ uri: MOODLE_LOGIN_URL }}
-                style={{ flex: 1 }}
-                javaScriptEnabled
-                domStorageEnabled
-                sharedCookiesEnabled
-                thirdPartyCookiesEnabled
-                cacheEnabled
-                incognito={false}
-                saveFormDataDisabled={false}
-                keyboardDisplayRequiresUserAction={false}
-                injectedJavaScript={MOODLE_INJECTED_SYNC_SCRIPT}
-                onNavigationStateChange={handleMoodleNavigationStateChange}
-                onMessage={handleMoodleWebViewMessage}
-              />
+              {Platform.OS !== 'web' && (
+                <WebView<{}>
+                  ref={moodleWebViewRef}
+                  source={{ uri: MOODLE_LOGIN_URL }}
+                  style={{ flex: 1 }}
+                  javaScriptEnabled
+                  domStorageEnabled
+                  sharedCookiesEnabled
+                  thirdPartyCookiesEnabled
+                  cacheEnabled
+                  incognito={false}
+                  saveFormDataDisabled={false}
+                  keyboardDisplayRequiresUserAction={false}
+                  injectedJavaScript={MOODLE_INJECTED_SYNC_SCRIPT}
+                  onNavigationStateChange={handleMoodleNavigationStateChange}
+                  onMessage={handleMoodleWebViewMessage}
+                />
+              )}
             </SafeAreaView>
           </SafeAreaProvider>
         </Modal>
@@ -4193,53 +4414,33 @@ export default function App() {
                 </View>
               )}
 
-              <WebView<{}>
-                ref={webworkWebViewRef}
-                source={{ uri: WEBWORK_LOGIN_URL }}
-                style={{ flex: 1 }}
-                javaScriptEnabled
-                domStorageEnabled
-                sharedCookiesEnabled
-                thirdPartyCookiesEnabled
-                cacheEnabled
-                incognito={false}
-                saveFormDataDisabled={false}
-                keyboardDisplayRequiresUserAction={false}
-                setSupportMultipleWindows={false}
-                onNavigationStateChange={handleWebworkNavigationStateChange}
-                onMessage={handleWebworkWebViewMessage}
-              />
+              {Platform.OS !== 'web' && (
+                <WebView<{}>
+                  ref={webworkWebViewRef}
+                  source={{ uri: WEBWORK_LOGIN_URL }}
+                  style={{ flex: 1 }}
+                  javaScriptEnabled
+                  domStorageEnabled
+                  sharedCookiesEnabled
+                  thirdPartyCookiesEnabled
+                  cacheEnabled
+                  incognito={false}
+                  saveFormDataDisabled={false}
+                  keyboardDisplayRequiresUserAction={false}
+                  setSupportMultipleWindows={false}
+                  onNavigationStateChange={handleWebworkNavigationStateChange}
+                  onMessage={handleWebworkWebViewMessage}
+                />
+              )}
             </SafeAreaView>
           </SafeAreaProvider>
         </Modal>
 
         {/* FLOATING NON-BLOCKING TOAST BANNER FOR SILENT BACKGROUND SYNC */}
-        {toastBanner && (
-          <View
-            style={[
-              styles.floatingToastBanner,
-              toastBanner.variant === 'warning'
-                ? styles.floatingToastWarning
-                : styles.floatingToastSuccess,
-            ]}
-          >
-            <Text style={styles.floatingToastText}>{toastBanner.message}</Text>
-            {toastBanner.variant === 'warning' && (
-              <TouchableOpacity
-                style={styles.floatingToastActionBtn}
-                onPress={() => {
-                  setToastBanner(null);
-                  setSettingsModalVisible(true);
-                }}
-              >
-                <Text style={styles.floatingToastActionText}>⚙️ הגדרות</Text>
-              </TouchableOpacity>
-            )}
-          </View>
-        )}
+        {!settingsModalVisible && renderFloatingToast()}
 
-        {/* HIDDEN 0x0 BACKGROUND WEBVIEW FOR SILENT MOODLE SYNC ON APP MOUNT */}
-        {bgMoodleSyncActive && !moodleModalVisible && (
+        {/* HIDDEN 0x0 BACKGROUND WEBVIEW FOR SILENT MOODLE SYNC ON APP MOUNT (MOBILE ONLY) */}
+        {Platform.OS !== 'web' && bgMoodleSyncActive && !moodleModalVisible && (
           <View style={styles.hiddenBgWebViewContainer} pointerEvents="none">
             <WebView<{}>
               ref={bgMoodleWebViewRef}
@@ -4413,6 +4614,46 @@ const styles = StyleSheet.create({
   settingsOptionText: {
     color: '#F9FAFB',
     fontSize: 15,
+    fontWeight: '700',
+  },
+  settingsDisabledOptionText: {
+    color: '#9CA3AF',
+  },
+  settingsWebInputContainer: {
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    borderBottomWidth: 1,
+    borderBottomColor: '#1F2937',
+  },
+  settingsWebInputLabel: {
+    color: '#93C5FD',
+    fontSize: 12,
+    fontWeight: '700',
+    marginBottom: 6,
+  },
+  settingsWebInput: {
+    backgroundColor: '#1F2937',
+    color: '#F9FAFB',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#374151',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 13,
+  },
+  settingsWebUploadBtn: {
+    marginTop: 8,
+    backgroundColor: '#1E3A8A',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#3B82F6',
+    paddingVertical: 9,
+    paddingHorizontal: 12,
+    alignItems: 'center',
+  },
+  settingsWebUploadBtnText: {
+    color: '#EFF6FF',
+    fontSize: 13,
     fontWeight: '700',
   },
   settingsToggleLabelText: {
