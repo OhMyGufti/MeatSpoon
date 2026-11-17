@@ -43,10 +43,15 @@ export function isWebworkAuthenticatedUrl(url: string): boolean {
 export const WEBWORK_MOODLE_NAVIGATION_HELPER_SCRIPT = `
 (function() {
   try {
-    // 1. Ensure links with target="_blank" open inside the same WebView
+    // 1. Ensure links and LTI forms with target="_blank" or contentframe open inside the same WebView
     var blankLinks = document.querySelectorAll('a[target="_blank"]');
     for (var i = 0; i < blankLinks.length; i++) {
       blankLinks[i].setAttribute('target', '_self');
+    }
+
+    var forms = document.querySelectorAll('form[target="_blank"], form[target="contentframe"]');
+    for (var f = 0; f < forms.length; f++) {
+      forms[f].setAttribute('target', '_self');
     }
 
     // 2. If the user opened a Moodle LTI wrapper page (mod/lti/view.php) that embeds
@@ -356,6 +361,11 @@ export const WEBWORK_INJECTED_SYNC_SCRIPT = `
 
       if (allExtracted.length > 0 || isManual) {
         postTasksToApp(allExtracted, isManual);
+      } else if (window.ReactNativeWebView && window.ReactNativeWebView.postMessage) {
+        window.ReactNativeWebView.postMessage(JSON.stringify({
+          type: 'WEBWORK_NO_TASKS_YET',
+          sourceUrl: window.location.href
+        }));
       }
       window.__meatSpoonWebworkSyncRunning = false;
       window.__meatSpoonForceWebworkScan = false;
@@ -476,32 +486,34 @@ function parseWebworkDeadline(text: string): Date | null {
     return new Date(year, month - 1, day, hours, minutes, 0, 0);
   }
 
-  // 2. Check MM/DD/YYYY or DD/MM/YYYY
-  const slashMatch = text.match(/\b(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\b/);
+  // 2. Check MM/DD/YYYY or DD/MM/YYYY or DD.MM.YYYY
+  const slashMatch = text.match(/\b(\d{1,2})([./-])(\d{1,2})\2(\d{2,4})\b/);
   if (slashMatch) {
     const p1 = parseInt(slashMatch[1], 10);
-    const p2 = parseInt(slashMatch[2], 10);
-    let year = parseInt(slashMatch[3], 10);
+    const sep = slashMatch[2];
+    const p2 = parseInt(slashMatch[3], 10);
+    let year = parseInt(slashMatch[4], 10);
     if (year < 100) year += 2000;
 
-    // Webwork in English defaults to MM/DD/YYYY unless p1 > 12 (then DD/MM/YYYY)
+    // Dot separator (DD.MM.YYYY @ HH:MM) at Technion Webwork is always DD.MM.YYYY.
+    // Slash separator in English defaults to MM/DD/YYYY unless p1 > 12 (then DD/MM/YYYY).
     let month: number;
     let day: number;
-    if (p1 > 12) {
+    if (sep === '.') {
+      day = p1;
+      month = p2;
+    } else if (p1 > 12) {
       day = p1;
       month = p2;
     } else if (p2 > 12) {
       month = p1;
       day = p2;
+    } else if (/\b(am|pm|closes)\b/i.test(text)) {
+      month = p1;
+      day = p2;
     } else {
-      // If text contains am/pm or English "closes", Webwork US locale uses MM/DD/YYYY; otherwise DD/MM/YYYY
-      if (/\b(am|pm|closes)\b/i.test(text)) {
-        month = p1;
-        day = p2;
-      } else {
-        day = p1;
-        month = p2;
-      }
+      day = p1;
+      month = p2;
     }
 
     const d = new Date(year, month - 1, day, hours, minutes, 0, 0);
@@ -509,4 +521,134 @@ function parseWebworkDeadline(text: string): Date | null {
   }
 
   return null;
+}
+
+export interface WebworkCourseOverride {
+  relationKey: string;
+  courseId?: string;
+  courseTitle: string;
+}
+
+function cleanWebworkTitleText(raw: string): string {
+  return raw
+    .replace(/\.?\s*Open[.,]?\s*(?:Due|Closes).*$/i, '')
+    .replace(/^[\s•·:.-]+|[\s•·:.-]+$/g, '')
+    .replace(/_/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Parses WebWork assignments for Web/PWA from:
+ * 1. JSON payload (`WEBWORK_TASKS_DATA`)
+ * 2. Copied plain text from Technion WebWork responsive accordion layout
+ *    (e.g., "Open Assignments", "HW02-Complex", ".Open. Due 19.11.2026 @ 23:59")
+ * 3. Copied classic WebWork table rows ("Set01 Open, closes 12/25/2026 at 11:59pm")
+ */
+export function parseWebworkTextInput(
+  rawInput: string,
+  events: ScheduleEvent[],
+  catalog: CourseCatalogItem[],
+  courseOverride?: WebworkCourseOverride | null
+): CourseTask[] {
+  const trimmed = (rawInput || '').trim();
+  if (!trimmed) return [];
+
+  const applyCourseOverride = (items: CourseTask[]): CourseTask[] => {
+    if (!courseOverride) return items;
+    return items.map((t) => ({
+      ...t,
+      relationKey: courseOverride.relationKey,
+      courseId: courseOverride.courseId,
+      courseTitle: courseOverride.courseTitle,
+      groupTitle: courseOverride.courseTitle,
+    }));
+  };
+
+  if (trimmed.startsWith('{')) {
+    const fromJson = parseWebworkSyncPayload(trimmed, events, catalog);
+    if (fromJson.length > 0) return applyCourseOverride(fromJson);
+  }
+
+  const lines = trimmed
+    .split(/\r?\n/)
+    .map((l) => l.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+
+  const extractedSets: RawWebworkSet[] = [];
+  const headerContext: string[] = [];
+  let inClosedSection = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // Stop or skip if inside the Closed Assignments section
+    if (/^closed\s+assignments/i.test(line) || /^past\s+assignments/i.test(line)) {
+      inClosedSection = true;
+      continue;
+    }
+    if (/^open\s+assignments/i.test(line)) {
+      inClosedSection = false;
+      continue;
+    }
+
+    if (i < 12) {
+      headerContext.push(line);
+    }
+
+    const hasOpenDuePattern =
+      /Open[.,]?\s*(?:Due|Closes)/i.test(line) ||
+      (!inClosedSection && /\b(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})\b/.test(line) && !/\bclosed\b|סגור|נסגר/i.test(line));
+
+    if (!hasOpenDuePattern) continue;
+
+    // Look for date/time on this line, or combine with the next line if copied split across lines
+    let statusLine = line;
+    if (!/\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b|\b\d{4}-\d{1,2}-\d{1,2}\b/.test(statusLine) && i + 1 < lines.length) {
+      statusLine = `${statusLine} ${lines[i + 1]}`;
+    }
+
+    const deadlineDate = parseWebworkDeadline(statusLine);
+    if (!deadlineDate) continue;
+
+    // Assignment title can appear before ".Open. Due" on the same line OR on the immediately preceding line
+    let setName = cleanWebworkTitleText(
+      line.split(/\.?\s*(?:Open[.,]?\s*(?:Due|Closes)|\b(?:19|20)\d{2}-\d{1,2}-\d{1,2}\b|\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b)/i)[0] || ''
+    );
+
+    if (
+      (!setName || /^(open\s+assignments|due|closes)$/i.test(setName)) &&
+      i > 0
+    ) {
+      const prevLine = lines[i - 1];
+      if (
+        prevLine &&
+        !/^open\s+assignments/i.test(prevLine) &&
+        !/^closed\s+assignments/i.test(prevLine) &&
+        !/Open[.,]?\s*(?:Due|Closes)/i.test(prevLine)
+      ) {
+        setName = cleanWebworkTitleText(prevLine);
+      }
+    }
+
+    if (!setName || /^(name|set name|open assignments|status)$/i.test(setName)) {
+      continue;
+    }
+
+    extractedSets.push({
+      setName,
+      deadlineISO: deadlineDate.toISOString(),
+      statusText: statusLine,
+      courseHint: headerContext.join(' '),
+      url: WEBWORK_LOGIN_URL,
+    });
+  }
+
+  const syntheticPayload = JSON.stringify({
+    type: 'WEBWORK_TASKS_DATA',
+    tasks: extractedSets,
+  });
+  return applyCourseOverride(
+    parseWebworkSyncPayload(syntheticPayload, events, catalog)
+  );
 }

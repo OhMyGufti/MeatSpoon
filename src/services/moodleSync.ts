@@ -2,8 +2,12 @@
 import { CourseCatalogItem, CourseTask, ScheduleEvent } from '../types/schedule';
 
 export const MOODLE_LOGIN_URL = 'https://moodle.technion.ac.il/';
+export const MOODLE_CALENDAR_EXPORT_PAGE_URL =
+  'https://moodle.technion.ac.il/calendar/export.php';
 export const MOODLE_CALENDAR_EXPORT_URL =
   'https://moodle.technion.ac.il/calendar/export_execute.php?preset_what=all&preset_time=recentupcoming';
+export const MOODLE_UPCOMING_EVENTS_URL =
+  'https://moodle.technion.ac.il/calendar/view.php?view=upcoming';
 
 /**
  * Detects whether a WebView URL indicates a redirect to the Moodle login page
@@ -107,7 +111,7 @@ export const MOODLE_INJECTED_SYNC_SCRIPT = `
     bodyEl.classList.contains('pagelayout-login');
 
   var hasLoginUiInDom = !!document.querySelector(
-    'form#login, input[name="password"], .loginform, a[href*="login/index.php"], .usermenu .login, [data-region="usermenu"] .login'
+    'form#login, input[name="password"], .loginform, .logininfo a[href*="login/index.php"], .usermenu .login, [data-region="usermenu"] .login, [data-region="usermenu"] a[href*="login/index.php"]'
   );
 
   // 3. Check positive authenticated student markers (Moodle guest is userid 1, unauthenticated is 0)
@@ -671,16 +675,23 @@ export function matchCourseForMoodleTask(
   // 1. Try matching by 6-to-8 digit Technion course number in hint
   const numberMatches = hint.match(/\b\d{6,8}\b/g) || [];
   for (const rawNum of numberMatches) {
-    const padded8 = rawNum.length === 6 ? `0${rawNum}0` : rawNum.padStart(8, '0');
+    // Technion 6-digit FFFNNN maps to 8-digit Cheesefork ID 0FFF0NNN (e.g. 104018 -> 01040018)
+    const technion8 =
+      rawNum.length === 6
+        ? `0${rawNum.slice(0, 3)}0${rawNum.slice(3)}`
+        : rawNum.padStart(8, '0');
+    const legacyPad8 = rawNum.length === 6 ? `0${rawNum}0` : technion8;
+
+    const matchesCourseId = (cid: string) =>
+      cid === rawNum ||
+      cid === technion8 ||
+      cid === legacyPad8 ||
+      cid.includes(rawNum) ||
+      rawNum.includes(cid);
 
     // Check active schedule events first
     const matchedScheduleEv = events.find(
-      (e) =>
-        e.courseId &&
-        (e.courseId === rawNum ||
-          e.courseId === padded8 ||
-          e.courseId.includes(rawNum) ||
-          rawNum.includes(e.courseId))
+      (e) => e.courseId && matchesCourseId(e.courseId)
     );
     if (matchedScheduleEv && matchedScheduleEv.courseId) {
       return {
@@ -691,13 +702,7 @@ export function matchCourseForMoodleTask(
     }
 
     // Check full Cheesefork catalog
-    const matchedCatalog = catalog.find(
-      (c) =>
-        c.courseId === rawNum ||
-        c.courseId === padded8 ||
-        c.courseId.includes(rawNum) ||
-        rawNum.includes(c.courseId)
-    );
+    const matchedCatalog = catalog.find((c) => matchesCourseId(c.courseId));
     if (matchedCatalog) {
       return {
         relationKey: `course:${matchedCatalog.courseId}`,
@@ -705,12 +710,6 @@ export function matchCourseForMoodleTask(
         courseTitle: matchedCatalog.name,
       };
     }
-
-    return {
-      relationKey: `course:${rawNum}`,
-      courseId: rawNum,
-      courseTitle: `Course ${rawNum}`,
-    };
   }
 
   // 2. Try matching by active course title substring
@@ -730,6 +729,16 @@ export function matchCourseForMoodleTask(
     }
   }
 
+  // 3. If a 6-8 digit course number was present in hint, use its canonical ID before generic fallback
+  if (numberMatches.length > 0) {
+    const rawNum = numberMatches[0];
+    return {
+      relationKey: `course:${rawNum}`,
+      courseId: rawNum,
+      courseTitle: `Course ${rawNum}`,
+    };
+  }
+
   // 3. Fallback: assign to first active course if present, or a dedicated "Moodle Tasks" group
   const firstCourseEv = events.find((e) => Boolean(e.courseId));
   if (firstCourseEv && firstCourseEv.courseId) {
@@ -744,4 +753,311 @@ export function matchCourseForMoodleTask(
     relationKey: fallbackKey,
     courseTitle: fallbackLabel,
   };
+}
+
+/**
+ * Deduplicates incoming synced tasks against existing local tasks by title & deadline minute,
+ * returning the sorted merged task array and the number of newly added tasks.
+ */
+export function mergeSyncedTasks(
+  existing: CourseTask[],
+  incoming: CourseTask[]
+): { merged: CourseTask[]; newlyAddedCount: number } {
+  const signatureFor = (task: CourseTask) =>
+    `${task.title.trim().toLowerCase()}__${Math.floor(
+      new Date(task.deadlineISO).getTime() / 60000
+    )}`;
+
+  const existingSignatures = new Set(existing.map(signatureFor));
+  const merged = [...existing];
+  let newlyAddedCount = 0;
+
+  for (const item of incoming) {
+    const sig = signatureFor(item);
+    if (!existingSignatures.has(sig)) {
+      existingSignatures.add(sig);
+      merged.push(item);
+      newlyAddedCount += 1;
+    }
+  }
+
+  merged.sort((a, b) => a.deadlineISO.localeCompare(b.deadlineISO));
+  return { merged, newlyAddedCount };
+}
+
+const ENGLISH_MONTHS: Record<string, number> = {
+  january: 0,
+  jan: 0,
+  february: 1,
+  feb: 1,
+  march: 2,
+  mar: 2,
+  april: 3,
+  apr: 3,
+  may: 4,
+  june: 5,
+  jun: 5,
+  july: 6,
+  jul: 6,
+  august: 7,
+  aug: 7,
+  september: 8,
+  sep: 8,
+  sept: 8,
+  october: 9,
+  oct: 9,
+  november: 10,
+  nov: 10,
+  december: 11,
+  dec: 11,
+};
+
+const HEBREW_MONTHS: Record<string, number> = {
+  ינואר: 0,
+  פברואר: 1,
+  מרץ: 2,
+  מרס: 2,
+  אפריל: 3,
+  מאי: 4,
+  יוני: 5,
+  יולי: 6,
+  אוגוסט: 7,
+  ספטמבר: 8,
+  אוקטובר: 9,
+  נובמבר: 10,
+  דצמבר: 11,
+};
+
+function parseMoodleDateLine(line: string): Date | null {
+  const clean = line.trim();
+  if (!clean) return null;
+
+  // Extract optional time first
+  let hour = 23;
+  let minute = 59;
+  const timeMatch = clean.match(/\b(\d{1,2}):(\d{2})\s*(am|pm)?\b/i);
+  if (timeMatch) {
+    let h = parseInt(timeMatch[1], 10);
+    const m = parseInt(timeMatch[2], 10);
+    const ampm = (timeMatch[3] || '').toLowerCase();
+    if (ampm === 'pm' && h < 12) h += 12;
+    if (ampm === 'am' && h === 12) h = 0;
+    if (h >= 0 && h <= 23 && m >= 0 && m <= 59) {
+      hour = h;
+      minute = m;
+    }
+  }
+
+  const defaultYear = new Date().getFullYear();
+
+  // 1. English month format: e.g. "Thursday, 19 November, 11:59 PM" or "19 November 2026"
+  const engMatch = clean.match(
+    /\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)(?:\s*,?\s*(\d{4}))?/i
+  );
+  if (engMatch) {
+    const day = parseInt(engMatch[1], 10);
+    const monthIdx = ENGLISH_MONTHS[engMatch[2].toLowerCase()];
+    const year = engMatch[3] ? parseInt(engMatch[3], 10) : defaultYear;
+    if (monthIdx !== undefined) {
+      const d = new Date(year, monthIdx, day, hour, minute, 0, 0);
+      if (!isNaN(d.getTime())) return d;
+    }
+  }
+
+  // 2. Hebrew month format: e.g. "יום חמישי, 19 בנובמבר 2026, 23:59" or "19 נובמבר"
+  const hebMatch = clean.match(
+    /(\d{1,2})\s+ב?(ינואר|פברואר|מרץ|מרס|אפריל|מאי|יוני|יולי|אוגוסט|ספטמבר|אוקטובר|נובמבר|דצמבר)(?:\s+(\d{4}))?/
+  );
+  if (hebMatch) {
+    const day = parseInt(hebMatch[1], 10);
+    const monthIdx = HEBREW_MONTHS[hebMatch[2]];
+    const year = hebMatch[3] ? parseInt(hebMatch[3], 10) : defaultYear;
+    if (monthIdx !== undefined) {
+      const d = new Date(year, monthIdx, day, hour, minute, 0, 0);
+      if (!isNaN(d.getTime())) return d;
+    }
+  }
+
+  // 3. Numeric formats: DD/MM/YYYY or DD.MM.YYYY or YYYY-MM-DD
+  const ymdMatch = clean.match(/\b(\d{4})-(\d{1,2})-(\d{1,2})\b/);
+  if (ymdMatch) {
+    const d = new Date(
+      parseInt(ymdMatch[1], 10),
+      parseInt(ymdMatch[2], 10) - 1,
+      parseInt(ymdMatch[3], 10),
+      hour,
+      minute,
+      0,
+      0
+    );
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  const dmyMatch = clean.match(/\b(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\b/);
+  if (dmyMatch) {
+    let year = parseInt(dmyMatch[3], 10);
+    if (year < 100) year += 2000;
+    const d = new Date(
+      year,
+      parseInt(dmyMatch[2], 10) - 1,
+      parseInt(dmyMatch[1], 10),
+      hour,
+      minute,
+      0,
+      0
+    );
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  return null;
+}
+
+const MOODLE_BOILERPLATE_LINE_RE =
+  /^(go to activity|add submission|view|edit|more|upcoming events|timeline|sort by dates|sort by courses|calendar|export calendar|new event|all courses|filter|today|מעבר לפעילות|הוספת הגשה|אירועים קרבים|ציר זמן|מיין לפי תאריך|מיין לפי קורס|לוח שנה|ייצוא לוח שנה|הצג|הכול|סנן|היום)$/i;
+
+/**
+ * Parses Moodle tasks for Web/PWA from:
+ * 1. Raw `.ics` iCalendar content (`BEGIN:VCALENDAR` / `BEGIN:VEVENT`) downloaded from Moodle Calendar Export
+ * 2. JSON payload (`MOODLE_CALENDAR_DATA`)
+ * 3. Copied plain text from Moodle's Upcoming Events OR Dashboard Timeline (English or Hebrew)
+ */
+export function parseMoodleWebImportText(
+  rawInput: string,
+  events: ScheduleEvent[],
+  catalog: CourseCatalogItem[]
+): CourseTask[] {
+  const trimmed = (rawInput || '').trim();
+  if (!trimmed) return [];
+
+  if (trimmed.includes('BEGIN:VCALENDAR') || trimmed.includes('BEGIN:VEVENT')) {
+    return parseMoodleSyncPayload(trimmed, events, catalog);
+  }
+
+  if (trimmed.startsWith('{')) {
+    const fromJson = parseMoodleSyncPayload(trimmed, events, catalog);
+    if (fromJson.length > 0) return fromJson;
+  }
+
+  // Fallback: Parse copied plain text from Moodle Upcoming Events or Dashboard Timeline
+  const lines = trimmed
+    .split(/\r?\n/)
+    .map((l) => l.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+
+  const tasks: CourseTask[] = [];
+  const seenKeys = new Set<string>();
+  let activeTimelineDate: Date | null = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // Check if this is a standalone time line ("23:59" or "11:59 PM") under a Dashboard Timeline date header
+    const standaloneTimeMatch = line.match(/^(\d{1,2}):(\d{2})\s*(am|pm)?$/i);
+    if (standaloneTimeMatch && activeTimelineDate && i + 1 < lines.length) {
+      let h = parseInt(standaloneTimeMatch[1], 10);
+      const m = parseInt(standaloneTimeMatch[2], 10);
+      const ampm = (standaloneTimeMatch[3] || '').toLowerCase();
+      if (ampm === 'pm' && h < 12) h += 12;
+      if (ampm === 'am' && h === 12) h = 0;
+
+      const candidateTitleLine = lines[i + 1];
+      if (
+        candidateTitleLine &&
+        !parseMoodleDateLine(candidateTitleLine) &&
+        !MOODLE_BOILERPLATE_LINE_RE.test(candidateTitleLine)
+      ) {
+        const deadlineDate = new Date(activeTimelineDate);
+        deadlineDate.setHours(h, m, 0, 0);
+
+        const title = cleanMoodleTaskTitle(candidateTitleLine);
+        const contextParts: string[] = [title];
+        if (i + 2 < lines.length) contextParts.push(lines[i + 2]);
+        if (i + 3 < lines.length) contextParts.push(lines[i + 3]);
+
+        const matched = matchCourseForMoodleTask(
+          contextParts.join(' '),
+          events,
+          catalog
+        );
+        const dedupeKey = `${title.toLowerCase()}__${Math.floor(
+          deadlineDate.getTime() / 60000
+        )}`;
+        if (title && !seenKeys.has(dedupeKey)) {
+          seenKeys.add(dedupeKey);
+          tasks.push({
+            id: `moodle-web-tl-${Date.now()}-${i}`,
+            relationKey: matched.relationKey,
+            courseId: matched.courseId,
+            courseTitle: matched.courseTitle,
+            groupTitle: matched.courseTitle,
+            title,
+            deadlineISO: deadlineDate.toISOString(),
+            description: `Imported from Moodle timeline (${line})`,
+            source: 'Moodle',
+            createdAtISO: new Date().toISOString(),
+          });
+        }
+        continue;
+      }
+    }
+
+    const deadlineDate = parseMoodleDateLine(line);
+    if (!deadlineDate) continue;
+
+    // Remember section date header in case subsequent lines are Dashboard Timeline items ("HH:MM" -> title)
+    const hasExplicitTime = /\b\d{1,2}:\d{2}\b/.test(line);
+    if (!hasExplicitTime) {
+      activeTimelineDate = deadlineDate;
+    }
+
+    // Upcoming Events layout: Event title sits 1-2 lines BEFORE its date/time line
+    let title = '';
+    for (let b = 1; b <= 2 && i - b >= 0; b++) {
+      const candidate = lines[i - b];
+      if (
+        parseMoodleDateLine(candidate) ||
+        MOODLE_BOILERPLATE_LINE_RE.test(candidate) ||
+        /^(\d{1,2}):(\d{2})\s*(am|pm)?$/i.test(candidate)
+      ) {
+        continue;
+      }
+      if (/^(course|קורס)\s*:/i.test(candidate)) continue;
+      title = cleanMoodleTaskTitle(candidate);
+      break;
+    }
+    if (!title) continue;
+
+    // Collect surrounding context lines for course matching
+    const contextParts: string[] = [title];
+    for (let offset = -2; offset <= 3; offset++) {
+      const neighbor = lines[i + offset];
+      if (neighbor) contextParts.push(neighbor);
+    }
+
+    const matched = matchCourseForMoodleTask(
+      contextParts.join(' '),
+      events,
+      catalog
+    );
+    const dedupeKey = `${title.toLowerCase()}__${Math.floor(
+      deadlineDate.getTime() / 60000
+    )}`;
+    if (seenKeys.has(dedupeKey)) continue;
+    seenKeys.add(dedupeKey);
+
+    tasks.push({
+      id: `moodle-web-${Date.now()}-${i}`,
+      relationKey: matched.relationKey,
+      courseId: matched.courseId,
+      courseTitle: matched.courseTitle,
+      groupTitle: matched.courseTitle,
+      title,
+      deadlineISO: deadlineDate.toISOString(),
+      description: `Imported from Moodle calendar text (${line})`,
+      source: 'Moodle',
+      createdAtISO: new Date().toISOString(),
+    });
+  }
+
+  return tasks;
 }
