@@ -57,7 +57,6 @@ import {
   isWebworkAuthenticatedUrl,
   parseWebworkSyncPayload,
 } from './src/services/webworkSync';
-import { CourseReviewsSummarySection } from './src/components/CourseReviewsSummarySection';
 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu'];
 // Feature 1: RTL Schedule Layout (Sunday = 0 on the far right, Thursday = 4 on the far left)
@@ -2879,11 +2878,6 @@ export default function App() {
                               : `Groups (${course.groups.length}) ▼`}
                           </Text>
                         </TouchableOpacity>
-
-                        {/* Course Reviews AI Summary Accordion ("✨ סיכום ביקורות AI") */}
-                        <CourseReviewsSummarySection
-                          courseId={course.courseId}
-                        />
 
                         {isExpanded &&
                           (course.groups.length === 0 ? (
