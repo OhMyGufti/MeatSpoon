@@ -1,5 +1,12 @@
 // src/services/moodleSync.ts
-import { CourseCatalogItem, CourseTask, ScheduleEvent } from '../types/schedule';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import {
+  ASYNC_STORAGE_KEY,
+  CourseCatalogItem,
+  CourseTask,
+  LocalBackupPayload,
+  ScheduleEvent,
+} from '../types/schedule';
 
 export const MOODLE_LOGIN_URL = 'https://moodle.technion.ac.il/';
 export const MOODLE_CALENDAR_EXPORT_URL =
@@ -744,4 +751,122 @@ export function matchCourseForMoodleTask(
     relationKey: fallbackKey,
     courseTitle: fallbackLabel,
   };
+}
+
+export function buildMoodleTaskSignature(task: CourseTask): string {
+  return `${task.title.trim().toLowerCase()}__${Math.floor(
+    new Date(task.deadlineISO).getTime() / 60000
+  )}`;
+}
+
+/**
+ * Deduplicates incoming tasks against existing tasks by normalized title + minute
+ * timestamp and sorts ascending by `deadlineISO`.
+ */
+export function mergeMoodleTasks(
+  existingTasks: CourseTask[],
+  incomingTasks: CourseTask[]
+): { mergedTasks: CourseTask[]; newlyAddedCount: number } {
+  const existingSignatures = new Set(existingTasks.map(buildMoodleTaskSignature));
+  const merged = [...existingTasks];
+  let newlyAddedCount = 0;
+
+  for (const incoming of incomingTasks) {
+    const sig = buildMoodleTaskSignature(incoming);
+    if (!existingSignatures.has(sig)) {
+      existingSignatures.add(sig);
+      merged.push(incoming);
+      newlyAddedCount += 1;
+    }
+  }
+
+  merged.sort((a, b) => a.deadlineISO.localeCompare(b.deadlineISO));
+  return { mergedTasks: merged, newlyAddedCount };
+}
+
+export type PersistedStateSnapshot = Omit<
+  LocalBackupPayload,
+  'version' | 'exportedAt'
+>;
+
+/**
+ * Merges synced Moodle tasks into the canonical AsyncStorage payload
+ * (`@meatspoon_persisted_state_v1`) using the exact `LocalBackupPayload` schema
+ * shared across Web and Native platforms.
+ */
+export async function persistMoodleTasksToStorage(
+  incomingTasks: CourseTask[],
+  stateSnapshot: PersistedStateSnapshot,
+  isHydratingStorage = false
+): Promise<{ mergedTasks: CourseTask[]; newlyAddedCount: number }> {
+  let existingPayload: Partial<LocalBackupPayload> = {};
+  if (isHydratingStorage) {
+    try {
+      const rawSaved = await AsyncStorage.getItem(ASYNC_STORAGE_KEY);
+      if (rawSaved) {
+        const parsed = JSON.parse(rawSaved) as Partial<LocalBackupPayload>;
+        if (parsed && typeof parsed === 'object') {
+          existingPayload = parsed;
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to read existing schedule state from AsyncStorage:', err);
+    }
+  }
+
+  const baseTasks =
+    isHydratingStorage && Array.isArray(existingPayload.tasks)
+      ? existingPayload.tasks
+      : stateSnapshot.tasks;
+
+  const { mergedTasks, newlyAddedCount } = mergeMoodleTasks(
+    baseTasks,
+    incomingTasks
+  );
+
+  const nextPayload: LocalBackupPayload = {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    events:
+      isHydratingStorage && Array.isArray(existingPayload.events)
+        ? existingPayload.events
+        : stateSnapshot.events,
+    tasks: mergedTasks,
+    desiredCourseIds:
+      isHydratingStorage && Array.isArray(existingPayload.desiredCourseIds)
+        ? existingPayload.desiredCourseIds
+        : stateSnapshot.desiredCourseIds,
+    lockedEvents:
+      isHydratingStorage && Array.isArray(existingPayload.lockedEvents)
+        ? existingPayload.lockedEvents
+        : stateSnapshot.lockedEvents,
+    hiddenKeys:
+      isHydratingStorage &&
+      existingPayload.hiddenKeys &&
+      typeof existingPayload.hiddenKeys === 'object'
+        ? existingPayload.hiddenKeys
+        : stateSnapshot.hiddenKeys,
+    includedSpecialGroups:
+      isHydratingStorage &&
+      existingPayload.includedSpecialGroups &&
+      typeof existingPayload.includedSpecialGroups === 'object'
+        ? existingPayload.includedSpecialGroups
+        : stateSnapshot.includedSpecialGroups,
+    autoOpenMoodleLogin:
+      isHydratingStorage && typeof existingPayload.autoOpenMoodleLogin === 'boolean'
+        ? existingPayload.autoOpenMoodleLogin
+        : stateSnapshot.autoOpenMoodleLogin,
+    moodleIcalUrl:
+      isHydratingStorage && typeof existingPayload.moodleIcalUrl === 'string'
+        ? existingPayload.moodleIcalUrl
+        : stateSnapshot.moodleIcalUrl,
+  };
+
+  try {
+    await AsyncStorage.setItem(ASYNC_STORAGE_KEY, JSON.stringify(nextPayload));
+  } catch (err) {
+    console.warn('Failed to save synced Moodle tasks to AsyncStorage:', err);
+  }
+
+  return { mergedTasks, newlyAddedCount };
 }

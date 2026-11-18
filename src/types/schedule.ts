@@ -71,3 +71,18 @@ export interface CourseCatalogItem {
   groups: CourseGroupItem[];
   exams: CourseExam[];
 }
+
+export const ASYNC_STORAGE_KEY = '@meatspoon_persisted_state_v1';
+
+export interface LocalBackupPayload {
+  version: number;
+  exportedAt: string;
+  events: ScheduleEvent[];
+  tasks: CourseTask[];
+  desiredCourseIds: string[];
+  lockedEvents: ScheduleEvent[];
+  hiddenKeys: Record<string, boolean>;
+  includedSpecialGroups: Record<string, boolean>;
+  autoOpenMoodleLogin?: boolean;
+  moodleIcalUrl?: string;
+}
