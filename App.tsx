@@ -67,6 +67,17 @@ import {
   isWebworkAuthenticatedUrl,
   parseWebworkSyncPayload,
 } from './src/services/webworkSync';
+import {
+  auth,
+  onAuthStateChanged,
+  User,
+  fetchUserScheduleFromCloud,
+  saveUserScheduleToCloud,
+} from './src/services/firebase';
+import {
+  signInWithGoogle,
+  signOutFromGoogle,
+} from './src/services/googleAuth';
 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu'];
 // Feature 1: RTL Schedule Layout (Sunday = 0 on the far right, Thursday = 4 on the far left)
@@ -492,6 +503,22 @@ export default function App() {
   const [customPaletteInput, setCustomPaletteInput] = useState<string>('#3B82F6');
   const [customPalette, setCustomPalette] = useState<string[] | null>(null);
 
+  // Firebase Auth & Cloud Sync State
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [cloudSyncStatus, setCloudSyncStatus] = useState<
+    'idle' | 'syncing' | 'synced' | 'offline'
+  >('idle');
+  const [authBusy, setAuthBusy] = useState<boolean>(false);
+  const isInitialCloudSyncDoneRef = useRef<boolean>(false);
+  const isApplyingCloudDataRef = useRef<boolean>(false);
+  const hasPendingLocalChangesRef = useRef<boolean>(false);
+  const cloudSyncDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  );
+  const buildLocalBackupPayloadRef = useRef<
+    (overrides?: Partial<LocalBackupPayload>) => LocalBackupPayload
+  >(() => ({} as LocalBackupPayload));
+
   const activeColorPalette = useMemo(
     () =>
       customPaletteEnabled && customPalette && customPalette.length === 8
@@ -891,6 +918,8 @@ export default function App() {
     customPalette: customPalette || undefined,
     ...overrides,
   });
+
+  buildLocalBackupPayloadRef.current = buildLocalBackupPayload;
 
   // Save schedule data back to AsyncStorage whenever courses, custom events, tasks, or settings change
   useEffect(() => {
@@ -1660,6 +1689,367 @@ export default function App() {
     }
   };
 
+  const applyBackupPayloadToState = async (
+    parsed: Partial<LocalBackupPayload>
+  ): Promise<LocalBackupPayload> => {
+    const incomingEvents = Array.isArray(parsed.events) ? parsed.events : [];
+    const incomingTasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+    const incomingDesired = Array.isArray(parsed.desiredCourseIds)
+      ? parsed.desiredCourseIds
+      : [];
+    const incomingLocked = Array.isArray(parsed.lockedEvents)
+      ? parsed.lockedEvents
+      : [];
+    const nextHiddenKeys =
+      parsed.hiddenKeys && typeof parsed.hiddenKeys === 'object'
+        ? parsed.hiddenKeys
+        : {};
+    const nextSpecialGroups =
+      parsed.includedSpecialGroups &&
+      typeof parsed.includedSpecialGroups === 'object'
+        ? { ...includedSpecialGroups, ...parsed.includedSpecialGroups }
+        : includedSpecialGroups;
+    const nextAutoOpenMoodle =
+      typeof parsed.autoOpenMoodleLogin === 'boolean'
+        ? parsed.autoOpenMoodleLogin
+        : autoOpenMoodleLogin;
+    const nextMoodleIcalUrl =
+      typeof parsed.moodleIcalUrl === 'string'
+        ? parsed.moodleIcalUrl
+        : moodleIcalUrl;
+    const nextFloatingFreeTime =
+      typeof parsed.floatingFreeTime === 'boolean'
+        ? parsed.floatingFreeTime
+        : floatingFreeTime;
+    const nextMyCoursesPinned =
+      typeof parsed.myCoursesPinned === 'boolean'
+        ? parsed.myCoursesPinned
+        : myCoursesPinned;
+
+    // Backwards-compatible restoration of Color/Palette settings
+    const hasPaletteFields =
+      typeof parsed.customPaletteEnabled === 'boolean' ||
+      typeof parsed.customPaletteBaseHex === 'string' ||
+      isValidPaletteMode(parsed.customPaletteMode) ||
+      (Array.isArray(parsed.customPalette) &&
+        parsed.customPalette.length === 8);
+
+    let nextCustomPaletteMode = customPaletteMode;
+    let nextCustomPaletteBaseHex = customPaletteBaseHex;
+    let nextCustomPalette = customPalette;
+    let nextCustomPaletteEnabled = customPaletteEnabled;
+
+    if (hasPaletteFields) {
+      nextCustomPaletteMode = isValidPaletteMode(parsed.customPaletteMode)
+        ? parsed.customPaletteMode
+        : 'analog';
+
+      const parsedBase =
+        typeof parsed.customPaletteBaseHex === 'string'
+          ? normalizeHexColor(parsed.customPaletteBaseHex) || ''
+          : '';
+
+      const parsedExplicitPalette =
+        Array.isArray(parsed.customPalette) &&
+        parsed.customPalette.length === 8 &&
+        parsed.customPalette.every((c) => typeof c === 'string')
+          ? parsed.customPalette
+          : null;
+
+      nextCustomPaletteEnabled =
+        typeof parsed.customPaletteEnabled === 'boolean'
+          ? parsed.customPaletteEnabled
+          : Boolean(parsedExplicitPalette || parsedBase);
+
+      if (nextCustomPaletteEnabled) {
+        const baseForGeneration =
+          parsedBase ||
+          (parsedExplicitPalette &&
+            normalizeHexColor(
+              parsedExplicitPalette[
+                getBaseColorSwatchIndex(nextCustomPaletteMode)
+              ]
+            )) ||
+          DEFAULT_COLOR_PALETTE[0];
+        nextCustomPaletteBaseHex = baseForGeneration;
+        nextCustomPalette =
+          parsedExplicitPalette ||
+          generateCustomPaletteFromHex(
+            baseForGeneration,
+            nextCustomPaletteMode
+          );
+      } else {
+        nextCustomPaletteBaseHex = parsedBase;
+        nextCustomPalette = parsedBase
+          ? parsedExplicitPalette ||
+            generateCustomPaletteFromHex(parsedBase, nextCustomPaletteMode)
+          : parsedExplicitPalette;
+      }
+    }
+
+    const appliedEvents = (() => {
+      if (!hasPaletteFields) return incomingEvents;
+      if (nextCustomPaletteEnabled && nextCustomPalette) {
+        const paletteSet = new Set(
+          nextCustomPalette.map((c) => c.toUpperCase())
+        );
+        const nonExamEvents = incomingEvents.filter((e) => e.type !== 'Exam');
+        const alreadyUsesPalette =
+          nonExamEvents.length === 0 ||
+          nonExamEvents.some((e) =>
+            paletteSet.has((e.color || '').toUpperCase())
+          );
+        return alreadyUsesPalette
+          ? incomingEvents
+          : remapEventsToPalette(incomingEvents, nextCustomPalette);
+      }
+      return incomingEvents;
+    })();
+
+    setEvents(appliedEvents);
+    setTasks(incomingTasks);
+    setDesiredCourseIds(incomingDesired);
+    setLockedEvents(incomingLocked);
+    setHiddenKeys(nextHiddenKeys);
+    setIncludedSpecialGroups(nextSpecialGroups);
+    setAutoOpenMoodleLogin(nextAutoOpenMoodle);
+    setMoodleIcalUrl(nextMoodleIcalUrl);
+    setFloatingFreeTime(nextFloatingFreeTime);
+    setMyCoursesPinned(nextMyCoursesPinned);
+    setCustomPaletteEnabled(nextCustomPaletteEnabled);
+    setCustomPaletteMode(nextCustomPaletteMode);
+    setCustomPaletteBaseHex(nextCustomPaletteBaseHex);
+    setCustomPaletteInput(nextCustomPaletteBaseHex || '#3B82F6');
+    setCustomPalette(nextCustomPalette);
+
+    if (nextCustomPaletteEnabled && nextCustomPalette) {
+      setCustomColor(
+        nextCustomPalette[getBaseColorSwatchIndex(nextCustomPaletteMode)] ||
+          nextCustomPalette[0]
+      );
+    } else if (hasPaletteFields && !nextCustomPaletteEnabled) {
+      setCustomColor(DEFAULT_COLOR_PALETTE[3]);
+    }
+
+    const restoredPayload = buildLocalBackupPayloadRef.current({
+      events: appliedEvents,
+      tasks: incomingTasks,
+      desiredCourseIds: incomingDesired,
+      lockedEvents: incomingLocked,
+      hiddenKeys: nextHiddenKeys,
+      includedSpecialGroups: nextSpecialGroups,
+      autoOpenMoodleLogin: nextAutoOpenMoodle,
+      moodleIcalUrl: nextMoodleIcalUrl,
+      floatingFreeTime: nextFloatingFreeTime,
+      myCoursesPinned: nextMyCoursesPinned,
+      customPaletteEnabled: nextCustomPaletteEnabled,
+      customPaletteBaseHex: nextCustomPaletteBaseHex,
+      customPaletteMode: nextCustomPaletteMode,
+      customPalette: nextCustomPalette || undefined,
+    });
+    await AsyncStorage.setItem(
+      ASYNC_STORAGE_KEY,
+      JSON.stringify(restoredPayload)
+    );
+    return restoredPayload;
+  };
+
+  // Listen to Firebase Auth state changes
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setCurrentUser(user);
+      if (!user) {
+        isInitialCloudSyncDoneRef.current = false;
+        isApplyingCloudDataRef.current = false;
+        hasPendingLocalChangesRef.current = false;
+        if (cloudSyncDebounceRef.current) {
+          clearTimeout(cloudSyncDebounceRef.current);
+          cloudSyncDebounceRef.current = null;
+        }
+        setCloudSyncStatus('idle');
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // On Sign-In / Login: Check if users/{uid} exists in Firestore -> download or upload initial local data
+  useEffect(() => {
+    if (isHydratingStorage || !currentUser) return;
+
+    let isCancelled = false;
+    const performInitialCloudSync = async () => {
+      isInitialCloudSyncDoneRef.current = false;
+      setCloudSyncStatus('syncing');
+      try {
+        const cloudData = await fetchUserScheduleFromCloud(currentUser.uid);
+        if (isCancelled) return;
+
+        if (
+          cloudData &&
+          (Array.isArray(cloudData.events) || Array.isArray(cloudData.tasks))
+        ) {
+          isApplyingCloudDataRef.current = true;
+          await applyBackupPayloadToState(cloudData);
+          if (!isCancelled) {
+            setCloudSyncStatus('synced');
+          }
+        } else {
+          // First-time user in Firestore: automatically upload current local AsyncStorage data
+          const localPayload = buildLocalBackupPayloadRef.current();
+          await saveUserScheduleToCloud(currentUser.uid, localPayload);
+          if (!isCancelled) {
+            setCloudSyncStatus('synced');
+          }
+        }
+      } catch (err) {
+        console.warn('Initial cloud sync failed (offline fallback active):', err);
+        if (!isCancelled) {
+          setCloudSyncStatus('offline');
+        }
+      } finally {
+        if (!isCancelled) {
+          isInitialCloudSyncDoneRef.current = true;
+        }
+      }
+    };
+
+    performInitialCloudSync();
+    return () => {
+      isCancelled = true;
+    };
+  }, [currentUser?.uid, isHydratingStorage]);
+
+  // Auto-Save on Changes: 2-second debounced Firestore push whenever signed-in user modifies schedule/tasks/settings
+  useEffect(() => {
+    if (isHydratingStorage || !currentUser) return;
+    if (!isInitialCloudSyncDoneRef.current) return;
+
+    if (isApplyingCloudDataRef.current) {
+      isApplyingCloudDataRef.current = false;
+      return;
+    }
+
+    hasPendingLocalChangesRef.current = true;
+    setCloudSyncStatus('syncing');
+
+    if (cloudSyncDebounceRef.current) {
+      clearTimeout(cloudSyncDebounceRef.current);
+    }
+
+    const uid = currentUser.uid;
+    cloudSyncDebounceRef.current = setTimeout(async () => {
+      try {
+        const latestPayload = buildLocalBackupPayloadRef.current();
+        await saveUserScheduleToCloud(uid, latestPayload);
+        hasPendingLocalChangesRef.current = false;
+        setCloudSyncStatus('synced');
+      } catch (err) {
+        console.warn('Cloud auto-save failed (offline mode):', err);
+        setCloudSyncStatus('offline');
+      }
+    }, 2000);
+
+    return () => {
+      if (cloudSyncDebounceRef.current) {
+        clearTimeout(cloudSyncDebounceRef.current);
+      }
+    };
+  }, [
+    isHydratingStorage,
+    currentUser?.uid,
+    events,
+    tasks,
+    desiredCourseIds,
+    lockedEvents,
+    hiddenKeys,
+    includedSpecialGroups,
+    autoOpenMoodleLogin,
+    moodleIcalUrl,
+    floatingFreeTime,
+    myCoursesPinned,
+    customPaletteEnabled,
+    customPaletteBaseHex,
+    customPaletteMode,
+    customPalette,
+  ]);
+
+  const handleGoogleSignIn = async () => {
+    try {
+      setAuthBusy(true);
+      await signInWithGoogle();
+      showToastNotification('Signed in with Google!', 'success');
+    } catch (err: any) {
+      const code = String(err?.code || '');
+      const isCancelled =
+        code === 'auth/popup-closed-by-user' ||
+        code === 'auth/cancelled-popup-request' ||
+        code === 'auth/cancelled' ||
+        code === 'SIGN_IN_CANCELLED' ||
+        code === '12501';
+      if (!isCancelled) {
+        console.warn('Google Sign-In error:', err);
+        showToastNotification('Google Sign-In could not complete', 'warning');
+      }
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleGoogleSignOut = async () => {
+    try {
+      setAuthBusy(true);
+      if (cloudSyncDebounceRef.current) {
+        clearTimeout(cloudSyncDebounceRef.current);
+        cloudSyncDebounceRef.current = null;
+      }
+      await signOutFromGoogle();
+      showToastNotification('Signed out of cloud sync', 'success');
+    } catch (err) {
+      console.warn('Sign-Out error:', err);
+      showToastNotification('Could not sign out', 'warning');
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleManualCloudSyncNow = async () => {
+    if (!currentUser) return;
+    try {
+      if (cloudSyncDebounceRef.current) {
+        clearTimeout(cloudSyncDebounceRef.current);
+        cloudSyncDebounceRef.current = null;
+      }
+      setCloudSyncStatus('syncing');
+
+      if (hasPendingLocalChangesRef.current) {
+        const latestPayload = buildLocalBackupPayloadRef.current();
+        await saveUserScheduleToCloud(currentUser.uid, latestPayload);
+        hasPendingLocalChangesRef.current = false;
+      } else {
+        const cloudData = await fetchUserScheduleFromCloud(currentUser.uid);
+        if (
+          cloudData &&
+          (Array.isArray(cloudData.events) || Array.isArray(cloudData.tasks))
+        ) {
+          isApplyingCloudDataRef.current = true;
+          await applyBackupPayloadToState(cloudData);
+        } else {
+          await saveUserScheduleToCloud(
+            currentUser.uid,
+            buildLocalBackupPayloadRef.current()
+          );
+        }
+      }
+
+      setCloudSyncStatus('synced');
+      showToastNotification('Cloud schedule synced!', 'success');
+    } catch (err) {
+      console.warn('Manual cloud sync failed:', err);
+      setCloudSyncStatus('offline');
+      showToastNotification('Offline — saved locally on device', 'warning');
+    }
+  };
+
   const handleLoadBackupFromText = async () => {
     const rawText = importJsonText.trim();
     if (!rawText) {
@@ -1681,165 +2071,7 @@ export default function App() {
         throw new Error('Missing valid schedule or tasks arrays.');
       }
 
-      const incomingEvents = Array.isArray(parsed.events) ? parsed.events : [];
-      const incomingTasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
-      const incomingDesired = Array.isArray(parsed.desiredCourseIds)
-        ? parsed.desiredCourseIds
-        : [];
-      const incomingLocked = Array.isArray(parsed.lockedEvents)
-        ? parsed.lockedEvents
-        : [];
-      const nextHiddenKeys =
-        parsed.hiddenKeys && typeof parsed.hiddenKeys === 'object'
-          ? parsed.hiddenKeys
-          : {};
-      const nextSpecialGroups =
-        parsed.includedSpecialGroups &&
-        typeof parsed.includedSpecialGroups === 'object'
-          ? { ...includedSpecialGroups, ...parsed.includedSpecialGroups }
-          : includedSpecialGroups;
-      const nextAutoOpenMoodle =
-        typeof parsed.autoOpenMoodleLogin === 'boolean'
-          ? parsed.autoOpenMoodleLogin
-          : autoOpenMoodleLogin;
-      const nextMoodleIcalUrl =
-        typeof parsed.moodleIcalUrl === 'string'
-          ? parsed.moodleIcalUrl
-          : moodleIcalUrl;
-      const nextFloatingFreeTime =
-        typeof parsed.floatingFreeTime === 'boolean'
-          ? parsed.floatingFreeTime
-          : floatingFreeTime;
-      const nextMyCoursesPinned =
-        typeof parsed.myCoursesPinned === 'boolean'
-          ? parsed.myCoursesPinned
-          : myCoursesPinned;
-
-      // Backwards-compatible restoration of Color/Palette settings
-      const hasPaletteFields =
-        typeof parsed.customPaletteEnabled === 'boolean' ||
-        typeof parsed.customPaletteBaseHex === 'string' ||
-        isValidPaletteMode(parsed.customPaletteMode) ||
-        (Array.isArray(parsed.customPalette) &&
-          parsed.customPalette.length === 8);
-
-      let nextCustomPaletteMode = customPaletteMode;
-      let nextCustomPaletteBaseHex = customPaletteBaseHex;
-      let nextCustomPalette = customPalette;
-      let nextCustomPaletteEnabled = customPaletteEnabled;
-
-      if (hasPaletteFields) {
-        nextCustomPaletteMode = isValidPaletteMode(parsed.customPaletteMode)
-          ? parsed.customPaletteMode
-          : 'analog';
-
-        const parsedBase =
-          typeof parsed.customPaletteBaseHex === 'string'
-            ? normalizeHexColor(parsed.customPaletteBaseHex) || ''
-            : '';
-
-        const parsedExplicitPalette =
-          Array.isArray(parsed.customPalette) &&
-          parsed.customPalette.length === 8 &&
-          parsed.customPalette.every((c) => typeof c === 'string')
-            ? parsed.customPalette
-            : null;
-
-        nextCustomPaletteEnabled =
-          typeof parsed.customPaletteEnabled === 'boolean'
-            ? parsed.customPaletteEnabled
-            : Boolean(parsedExplicitPalette || parsedBase);
-
-        if (nextCustomPaletteEnabled) {
-          const baseForGeneration =
-            parsedBase ||
-            (parsedExplicitPalette &&
-              normalizeHexColor(
-                parsedExplicitPalette[
-                  getBaseColorSwatchIndex(nextCustomPaletteMode)
-                ]
-              )) ||
-            DEFAULT_COLOR_PALETTE[0];
-          nextCustomPaletteBaseHex = baseForGeneration;
-          nextCustomPalette =
-            parsedExplicitPalette ||
-            generateCustomPaletteFromHex(
-              baseForGeneration,
-              nextCustomPaletteMode
-            );
-        } else {
-          nextCustomPaletteBaseHex = parsedBase;
-          nextCustomPalette = parsedBase
-            ? parsedExplicitPalette ||
-              generateCustomPaletteFromHex(parsedBase, nextCustomPaletteMode)
-            : parsedExplicitPalette;
-        }
-      }
-
-      const appliedEvents = (() => {
-        if (!hasPaletteFields) return incomingEvents;
-        if (nextCustomPaletteEnabled && nextCustomPalette) {
-          const paletteSet = new Set(
-            nextCustomPalette.map((c) => c.toUpperCase())
-          );
-          const nonExamEvents = incomingEvents.filter((e) => e.type !== 'Exam');
-          const alreadyUsesPalette =
-            nonExamEvents.length === 0 ||
-            nonExamEvents.some((e) =>
-              paletteSet.has((e.color || '').toUpperCase())
-            );
-          return alreadyUsesPalette
-            ? incomingEvents
-            : remapEventsToPalette(incomingEvents, nextCustomPalette);
-        }
-        return incomingEvents;
-      })();
-
-      setEvents(appliedEvents);
-      setTasks(incomingTasks);
-      setDesiredCourseIds(incomingDesired);
-      setLockedEvents(incomingLocked);
-      setHiddenKeys(nextHiddenKeys);
-      setIncludedSpecialGroups(nextSpecialGroups);
-      setAutoOpenMoodleLogin(nextAutoOpenMoodle);
-      setMoodleIcalUrl(nextMoodleIcalUrl);
-      setFloatingFreeTime(nextFloatingFreeTime);
-      setMyCoursesPinned(nextMyCoursesPinned);
-      setCustomPaletteEnabled(nextCustomPaletteEnabled);
-      setCustomPaletteMode(nextCustomPaletteMode);
-      setCustomPaletteBaseHex(nextCustomPaletteBaseHex);
-      setCustomPaletteInput(nextCustomPaletteBaseHex || '#3B82F6');
-      setCustomPalette(nextCustomPalette);
-
-      if (nextCustomPaletteEnabled && nextCustomPalette) {
-        setCustomColor(
-          nextCustomPalette[getBaseColorSwatchIndex(nextCustomPaletteMode)] ||
-            nextCustomPalette[0]
-        );
-      } else if (hasPaletteFields && !nextCustomPaletteEnabled) {
-        setCustomColor(DEFAULT_COLOR_PALETTE[3]);
-      }
-
-      const restoredPayload = buildLocalBackupPayload({
-        events: appliedEvents,
-        tasks: incomingTasks,
-        desiredCourseIds: incomingDesired,
-        lockedEvents: incomingLocked,
-        hiddenKeys: nextHiddenKeys,
-        includedSpecialGroups: nextSpecialGroups,
-        autoOpenMoodleLogin: nextAutoOpenMoodle,
-        moodleIcalUrl: nextMoodleIcalUrl,
-        floatingFreeTime: nextFloatingFreeTime,
-        myCoursesPinned: nextMyCoursesPinned,
-        customPaletteEnabled: nextCustomPaletteEnabled,
-        customPaletteBaseHex: nextCustomPaletteBaseHex,
-        customPaletteMode: nextCustomPaletteMode,
-        customPalette: nextCustomPalette || undefined,
-      });
-      await AsyncStorage.setItem(
-        ASYNC_STORAGE_KEY,
-        JSON.stringify(restoredPayload)
-      );
+      const restoredPayload = await applyBackupPayloadToState(parsed);
 
       setImportJsonText('');
       setBackupModalVisible(false);
@@ -1847,7 +2079,7 @@ export default function App() {
       showToastNotification('Schedule backup restored!', 'success');
       Alert.alert(
         '📥 Backup Loaded Successfully',
-        `Restored ${incomingEvents.length} event(s) and ${incomingTasks.length} task(s) to your schedule.`
+        `Restored ${restoredPayload.events.length} event(s) and ${restoredPayload.tasks.length} task(s) to your schedule.`
       );
     } catch {
       Alert.alert(
@@ -2691,6 +2923,116 @@ export default function App() {
                 style={{ maxHeight: 420 }}
                 showsVerticalScrollIndicator={false}
               >
+                {/* SECTION 0: ACCOUNT & CLOUD SYNC */}
+                <Text style={styles.settingsSectionLabel}>
+                  ACCOUNT & CLOUD SYNC
+                </Text>
+                <View style={styles.settingsGroupBox}>
+                  {currentUser ? (
+                    <View style={styles.cloudAccountCard}>
+                      <View style={styles.cloudAccountHeaderRow}>
+                        <View style={styles.cloudAccountIdentity}>
+                          {currentUser.displayName ? (
+                            <Text
+                              style={styles.cloudAccountNameText}
+                              numberOfLines={1}
+                            >
+                              {currentUser.displayName}
+                            </Text>
+                          ) : null}
+                          <Text
+                            style={styles.cloudAccountEmailText}
+                            numberOfLines={1}
+                          >
+                            {currentUser.email || 'Signed in with Google'}
+                          </Text>
+                        </View>
+
+                        <View
+                          style={[
+                            styles.cloudStatusBadge,
+                            cloudSyncStatus === 'synced' &&
+                              styles.cloudStatusBadgeSynced,
+                            cloudSyncStatus === 'syncing' &&
+                              styles.cloudStatusBadgeSyncing,
+                            cloudSyncStatus === 'offline' &&
+                              styles.cloudStatusBadgeOffline,
+                          ]}
+                        >
+                          <View
+                            style={[
+                              styles.cloudStatusDot,
+                              cloudSyncStatus === 'synced' &&
+                                styles.cloudStatusDotSynced,
+                              cloudSyncStatus === 'syncing' &&
+                                styles.cloudStatusDotSyncing,
+                              cloudSyncStatus === 'offline' &&
+                                styles.cloudStatusDotOffline,
+                            ]}
+                          />
+                          <Text style={styles.cloudStatusBadgeText}>
+                            {cloudSyncStatus === 'syncing'
+                              ? 'Syncing...'
+                              : cloudSyncStatus === 'offline'
+                              ? 'Offline'
+                              : 'Synced'}
+                          </Text>
+                        </View>
+                      </View>
+
+                      <View style={styles.cloudAccountActionsRow}>
+                        <TouchableOpacity
+                          style={[
+                            styles.cloudActionBtn,
+                            styles.cloudSyncNowBtn,
+                            cloudSyncStatus === 'syncing' &&
+                              styles.cloudActionBtnDisabled,
+                          ]}
+                          disabled={cloudSyncStatus === 'syncing' || authBusy}
+                          onPress={handleManualCloudSyncNow}
+                        >
+                          <Text style={styles.cloudSyncNowBtnText}>
+                            {cloudSyncStatus === 'syncing'
+                              ? '⏳ Syncing...'
+                              : '🔄 Sync Now'}
+                          </Text>
+                        </TouchableOpacity>
+
+                        <TouchableOpacity
+                          style={[styles.cloudActionBtn, styles.cloudSignOutBtn]}
+                          disabled={authBusy}
+                          onPress={handleGoogleSignOut}
+                        >
+                          <Text style={styles.cloudSignOutBtnText}>
+                            Sign Out
+                          </Text>
+                        </TouchableOpacity>
+                      </View>
+                    </View>
+                  ) : (
+                    <View style={styles.cloudSignInContainer}>
+                      <TouchableOpacity
+                        style={[
+                          styles.cloudGoogleSignInBtn,
+                          authBusy && styles.cloudActionBtnDisabled,
+                        ]}
+                        disabled={authBusy}
+                        onPress={handleGoogleSignIn}
+                      >
+                        <Text style={styles.cloudGoogleSignInBtnText}>
+                          {authBusy
+                            ? '⏳ Signing in...'
+                            : '☁️ Sign in with Google'}
+                        </Text>
+                      </TouchableOpacity>
+                      <Text style={styles.cloudSignInSubText}>
+                        Automatically back up and sync your schedule, tasks &
+                        palette across devices.
+                      </Text>
+                    </View>
+                  )}
+                </View>
+
                 {/* SECTION 1: ACADEMIC SYNC */}
                 <Text style={styles.settingsSectionLabel}>
                   ACADEMIC ASSIGNMENTS SYNC
@@ -5231,6 +5573,150 @@ const styles = StyleSheet.create({
     color: '#6B7280',
     fontSize: 18,
     fontWeight: '700',
+  },
+  cloudAccountCard: {
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    gap: 10,
+  },
+  cloudAccountHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  cloudAccountIdentity: {
+    flex: 1,
+  },
+  cloudAccountNameText: {
+    color: '#F9FAFB',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  cloudAccountEmailText: {
+    color: '#9CA3AF',
+    fontSize: 12,
+    marginTop: 1,
+  },
+  cloudStatusBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#374151',
+    backgroundColor: '#1F2937',
+    gap: 5,
+  },
+  cloudStatusBadgeSynced: {
+    backgroundColor: 'rgba(16, 185, 129, 0.14)',
+    borderColor: 'rgba(16, 185, 129, 0.45)',
+  },
+  cloudStatusBadgeSyncing: {
+    backgroundColor: 'rgba(59, 130, 246, 0.14)',
+    borderColor: 'rgba(59, 130, 246, 0.45)',
+  },
+  cloudStatusBadgeOffline: {
+    backgroundColor: 'rgba(245, 158, 11, 0.14)',
+    borderColor: 'rgba(245, 158, 11, 0.45)',
+  },
+  cloudStatusDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: '#9CA3AF',
+  },
+  cloudStatusDotSynced: {
+    backgroundColor: '#10B981',
+  },
+  cloudStatusDotSyncing: {
+    backgroundColor: '#3B82F6',
+  },
+  cloudStatusDotOffline: {
+    backgroundColor: '#F59E0B',
+  },
+  cloudStatusBadgeText: {
+    color: '#E5E7EB',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  cloudAccountActionsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  cloudActionBtn: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cloudActionBtnDisabled: {
+    opacity: 0.6,
+  },
+  cloudSyncNowBtn: {
+    flex: 1,
+    backgroundColor: '#1D4ED8',
+    borderColor: '#3B82F6',
+  },
+  cloudSyncNowBtnText: {
+    color: '#FFFFFF',
+    fontSize: 12.5,
+    fontWeight: '700',
+  },
+  cloudSignOutBtn: {
+    backgroundColor: '#1F2937',
+    borderColor: '#374151',
+  },
+  cloudSignOutBtnText: {
+    color: '#D1D5DB',
+    fontSize: 12.5,
+    fontWeight: '700',
+  },
+  cloudSignInContainer: {
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    gap: 6,
+  },
+  cloudGoogleSignInBtn: {
+    backgroundColor: '#2563EB',
+    borderColor: '#3B82F6',
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cloudGoogleSignInBtnText: {
+    color: '#FFFFFF',
+    fontSize: 13.5,
+    fontWeight: '800',
+  },
+  cloudSignInSubText: {
+    color: '#9CA3AF',
+    fontSize: 11,
+    lineHeight: 15,
+    textAlign: 'center',
+  },
+  cloudGoogleSignInBtnNativeDisabled: {
+    backgroundColor: '#1F2937',
+    borderColor: '#374151',
+    opacity: 0.65,
+  },
+  cloudNativeComingSoonTitle: {
+    color: '#9CA3AF',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  cloudNativeComingSoonNote: {
+    color: '#9CA3AF',
+    fontSize: 11,
+    fontStyle: 'italic',
+    textAlign: 'center',
   },
   settingsPaletteContainer: {
     paddingHorizontal: 14,

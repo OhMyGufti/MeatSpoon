@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "35614474326",
+    "project_id": "meatspooncal",
+    "storage_bucket": "meatspooncal.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:35614474326:android:674c8210ea1ad00ccabbf7",
+        "android_client_info": {
+          "package_name": "com.meatspoon.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "35614474326-efp32sdcp6l6tl6co8jqott72fia0sbn.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.meatspoon.app",
+            "certificate_hash": "d899c3b1a6357a12b6190722c15c3488eb81fa20"
+          }
+        },
+        {
+          "client_id": "35614474326-gcvog04g7sprjhld2b8cgva47t2ui62h.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCr31VEGwba0aU15rjY5QCKHorsWxd2hbQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "35614474326-gcvog04g7sprjhld2b8cgva47t2ui62h.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

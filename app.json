@@ -15,11 +15,12 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.technion.meatspoon"
+      "bundleIdentifier": "com.meatspoon.app"
     },
     "android": {
-      "package": "com.technion.meatspoon",
+      "package": "com.meatspoon.app",
       "versionCode": 2,
+      "googleServicesFile": "./google-services.json",
       "adaptiveIcon": {
         "foregroundImage": "./assets/icon.png",
         "backgroundColor": "#111827"
@@ -32,7 +33,8 @@
     "plugins": [
       "expo-status-bar",
       "expo-web-browser",
-      "expo-sharing"
+      "expo-sharing",
+      "@react-native-google-signin/google-signin"
     ],
     "extra": {
       "eas": {
