@@ -1,4 +1,5 @@
 // src/services/cheesefork.ts
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   CourseCatalogItem,
   CourseExam,
@@ -8,6 +9,105 @@ import {
 
 export const CHEESEFORK_JS_URL =
   'https://sap.cheesefork.cf/courses_2026_200.min.js';
+
+export const CHEESEFORK_CACHE_META_KEY = '@meatspoon_cheesefork_cache_meta_v1';
+export const CHEESEFORK_CACHE_CHUNK_PREFIX =
+  '@meatspoon_cheesefork_cache_chunk_v1_';
+const CACHE_CHUNK_SIZE = 250;
+
+/**
+ * Saves the normalized Cheesefork course catalog to AsyncStorage in chunks
+ * so large catalogs never exceed Android's 2MB per-row CursorWindow limit
+ * or Web storage limits.
+ */
+export async function saveCachedCheeseforkCatalog(
+  courses: CourseCatalogItem[]
+): Promise<void> {
+  if (!Array.isArray(courses) || courses.length === 0) return;
+
+  try {
+    const chunks: CourseCatalogItem[][] = [];
+    for (let i = 0; i < courses.length; i += CACHE_CHUNK_SIZE) {
+      chunks.push(courses.slice(i, i + CACHE_CHUNK_SIZE));
+    }
+
+    const pairs: [string, string][] = chunks.map((chunk, idx) => [
+      `${CHEESEFORK_CACHE_CHUNK_PREFIX}${idx}`,
+      JSON.stringify(chunk),
+    ]);
+    pairs.push([
+      CHEESEFORK_CACHE_META_KEY,
+      JSON.stringify({
+        version: 1,
+        cachedAt: new Date().toISOString(),
+        chunkCount: chunks.length,
+        totalCourses: courses.length,
+      }),
+    ]);
+
+    await AsyncStorage.multiSet(pairs);
+  } catch (err) {
+    console.warn('Failed to cache Cheesefork catalog to AsyncStorage:', err);
+  }
+}
+
+/**
+ * Loads the last cached Cheesefork course catalog from AsyncStorage for
+ * instant startup and offline fallback.
+ */
+export async function loadCachedCheeseforkCatalog(): Promise<
+  CourseCatalogItem[]
+> {
+  try {
+    const rawMeta = await AsyncStorage.getItem(CHEESEFORK_CACHE_META_KEY);
+    if (!rawMeta) return [];
+
+    const meta = JSON.parse(rawMeta) as { chunkCount?: number };
+    const chunkCount = Number(meta?.chunkCount || 0);
+    if (chunkCount <= 0) return [];
+
+    const keys = Array.from(
+      { length: chunkCount },
+      (_, idx) => `${CHEESEFORK_CACHE_CHUNK_PREFIX}${idx}`
+    );
+    const entries = await AsyncStorage.multiGet(keys);
+
+    const courses: CourseCatalogItem[] = [];
+    for (const [, value] of entries) {
+      if (!value) continue;
+      const parsedChunk = JSON.parse(value);
+      if (Array.isArray(parsedChunk)) {
+        courses.push(...parsedChunk);
+      }
+    }
+    return courses;
+  } catch (err) {
+    console.warn('Failed to load cached Cheesefork catalog:', err);
+    return [];
+  }
+}
+
+/**
+ * Fetches live Cheesefork course data and updates the local cache.
+ * If the device is offline or the fetch fails, gracefully falls back to the
+ * last cached catalog without throwing when cached data is available.
+ */
+export async function syncCheeseforkCatalogWithCache(): Promise<{
+  courses: CourseCatalogItem[];
+  fromCache: boolean;
+}> {
+  try {
+    const liveCourses = await fetchCheeseforkCatalog();
+    await saveCachedCheeseforkCatalog(liveCourses);
+    return { courses: liveCourses, fromCache: false };
+  } catch (fetchErr) {
+    const cachedCourses = await loadCachedCheeseforkCatalog();
+    if (cachedCourses.length > 0) {
+      return { courses: cachedCourses, fromCache: true };
+    }
+    throw fetchErr;
+  }
+}
 
 /**
  * 1. Fetches the Cheesefork JS script directly via HTTP:

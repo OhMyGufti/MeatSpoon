@@ -85,4 +85,8 @@ export interface LocalBackupPayload {
   includedSpecialGroups: Record<string, boolean>;
   autoOpenMoodleLogin?: boolean;
   moodleIcalUrl?: string;
+  floatingFreeTime?: boolean;
+  myCoursesPinned?: boolean;
+  customPaletteBaseHex?: string;
+  customPalette?: string[];
 }

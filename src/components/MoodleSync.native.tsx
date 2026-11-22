@@ -26,6 +26,7 @@ import {
   persistMoodleTasksToStorage,
 } from '../services/moodleSync';
 import { MoodleSyncProps } from './MoodleSync.types';
+import { useMenuBackHandler } from '../hooks/useMenuBackHandler';
 
 /**
  * Native (Android / iOS APK) Moodle Sync component.
@@ -61,6 +62,10 @@ export default function MoodleSync({
   const [bgMoodleSyncActive, setBgMoodleSyncActive] = useState(true);
   const bgMoodleWebViewRef = useRef<WebView<{}> | null>(null);
   const bgMoodleHandledRef = useRef(false);
+
+  useMenuBackHandler(mode === 'runtime' && modalVisible, () =>
+    onChangeModalVisible(false)
+  );
 
   useEffect(() => {
     if (modalVisible) {

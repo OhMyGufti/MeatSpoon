@@ -800,18 +800,16 @@ export async function persistMoodleTasksToStorage(
   isHydratingStorage = false
 ): Promise<{ mergedTasks: CourseTask[]; newlyAddedCount: number }> {
   let existingPayload: Partial<LocalBackupPayload> = {};
-  if (isHydratingStorage) {
-    try {
-      const rawSaved = await AsyncStorage.getItem(ASYNC_STORAGE_KEY);
-      if (rawSaved) {
-        const parsed = JSON.parse(rawSaved) as Partial<LocalBackupPayload>;
-        if (parsed && typeof parsed === 'object') {
-          existingPayload = parsed;
-        }
+  try {
+    const rawSaved = await AsyncStorage.getItem(ASYNC_STORAGE_KEY);
+    if (rawSaved) {
+      const parsed = JSON.parse(rawSaved) as Partial<LocalBackupPayload>;
+      if (parsed && typeof parsed === 'object') {
+        existingPayload = parsed;
       }
-    } catch (err) {
-      console.warn('Failed to read existing schedule state from AsyncStorage:', err);
     }
+  } catch (err) {
+    console.warn('Failed to read existing schedule state from AsyncStorage:', err);
   }
 
   const baseTasks =
@@ -825,6 +823,7 @@ export async function persistMoodleTasksToStorage(
   );
 
   const nextPayload: LocalBackupPayload = {
+    ...existingPayload,
     version: 1,
     exportedAt: new Date().toISOString(),
     events:

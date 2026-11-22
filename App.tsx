@@ -40,11 +40,19 @@ import {
 } from './src/utils/autoScheduleBuilder';
 import {
   fetchCheeseforkCatalog,
+  loadCachedCheeseforkCatalog,
   mergeIdenticalCourseGroups,
+  syncCheeseforkCatalogWithCache,
   CHEESEFORK_JS_URL,
 } from './src/services/cheesefork';
 import { mergeMoodleTasks } from './src/services/moodleSync';
 import MoodleSync from './src/components/MoodleSync';
+import { useMenuBackHandler } from './src/hooks/useMenuBackHandler';
+import {
+  DEFAULT_COLOR_PALETTE,
+  generateCustomPaletteFromHex,
+  normalizeHexColor,
+} from './src/utils/colorPalette';
 import {
   WEBWORK_LOGIN_URL,
   WEBWORK_INJECTED_SYNC_SCRIPT,
@@ -62,17 +70,39 @@ const END_HOUR = 20;
 const DEFAULT_PIXELS_PER_HOUR = 80;
 const MIN_PIXELS_PER_HOUR = 36;
 const MAX_PIXELS_PER_HOUR = 140;
+const FLOATING_BTN_SIZE = 50;
+const FLOATING_EDGE_PADDING = 14;
 
-const COLOR_PALETTE = [
-  '#3B82F6', // Blue
-  '#10B981', // Emerald
-  '#8B5CF6', // Violet
-  '#F59E0B', // Amber
-  '#EC4899', // Pink
-  '#EF4444', // Red
-  '#14B8A6', // Teal
-  '#6366F1', // Indigo
-];
+type FloatingCorner = 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
+
+function normalizeCourseDigits(rawId?: string): string[] {
+  if (!rawId) return [];
+  const digits = rawId.replace(/\D/g, '');
+  if (!digits) return [rawId.trim()];
+  const variants = new Set<string>([digits]);
+  if (digits.length === 6) {
+    variants.add(`0${digits}0`);
+    variants.add(`0${digits.slice(0, 3)}0${digits.slice(3)}`);
+    variants.add(digits.padStart(8, '0'));
+  } else if (digits.length === 8) {
+    if (digits.startsWith('0') && digits.endsWith('0')) {
+      variants.add(digits.slice(1, 7));
+    }
+    if (digits.startsWith('0') && digits[4] === '0') {
+      variants.add(`${digits.slice(1, 4)}${digits.slice(5)}`);
+    }
+    variants.add(digits.replace(/^0+/, ''));
+  }
+  return Array.from(variants);
+}
+
+function doesCourseIdMatch(idA?: string, idB?: string): boolean {
+  if (!idA || !idB) return false;
+  if (idA.trim() === idB.trim()) return true;
+  const varsA = normalizeCourseDigits(idA);
+  const varsB = new Set(normalizeCourseDigits(idB));
+  return varsA.some((v) => varsB.has(v));
+}
 
 const GROUP_SECTIONS: {
   type: 'Lecture' | 'Tutorial' | 'Lab';
@@ -445,6 +475,20 @@ export default function App() {
   const [moodleModalVisible, setMoodleModalVisible] = useState(false);
   const [autoOpenMoodleLogin, setAutoOpenMoodleLogin] = useState<boolean>(true);
   const [moodleIcalUrl, setMoodleIcalUrl] = useState<string>('');
+  const [floatingFreeTime, setFloatingFreeTime] = useState<boolean>(false);
+  const [myCoursesPinned, setMyCoursesPinned] = useState<boolean>(true);
+  const [customPaletteBaseHex, setCustomPaletteBaseHex] = useState<string>('');
+  const [customPaletteInput, setCustomPaletteInput] = useState<string>('#3B82F6');
+  const [customPalette, setCustomPalette] = useState<string[] | null>(null);
+
+  const activeColorPalette = useMemo(
+    () =>
+      customPalette && customPalette.length === 8
+        ? customPalette
+        : DEFAULT_COLOR_PALETTE,
+    [customPalette]
+  );
+
   const [toastBanner, setToastBanner] = useState<{
     message: string;
     variant: 'success' | 'warning';
@@ -463,9 +507,199 @@ export default function App() {
   const [freeTimeModalVisible, setFreeTimeModalVisible] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
 
+  // Platform-Specific Back Button Handling across all menus & modals (Native APK & Web PWA)
+  useMenuBackHandler(spoonMenuVisible, () => setSpoonMenuVisible(false));
+  useMenuBackHandler(settingsModalVisible, () => setSettingsModalVisible(false));
+  useMenuBackHandler(searchModalVisible, () => setSearchModalVisible(false));
+  useMenuBackHandler(!!selectedEvent, () => setSelectedEvent(null));
+  useMenuBackHandler(customModalVisible, () => setCustomModalVisible(false));
+  useMenuBackHandler(autoBuilderModalVisible, () =>
+    setAutoBuilderModalVisible(false)
+  );
+  useMenuBackHandler(freeTimeModalVisible, () =>
+    setFreeTimeModalVisible(false)
+  );
+  useMenuBackHandler(taskModalVisible, () => setTaskModalVisible(false));
+  useMenuBackHandler(!!selectedTask, () => setSelectedTask(null));
+  useMenuBackHandler(backupModalVisible, () => setBackupModalVisible(false));
+  useMenuBackHandler(aboutModalVisible, () => setAboutModalVisible(false));
+  useMenuBackHandler(webworkModalVisible, () => setWebworkModalVisible(false));
+
   // "Free Time" Spontaneous Finder State
   const [spontaneousEvents, setSpontaneousEvents] = useState<SpontaneousEventItem[]>([]);
   const [freeTimeCheckedAt, setFreeTimeCheckedAt] = useState<Date | null>(null);
+
+  // Draggable & 4-Corner Magnetized Floating "Free Time" Button State
+  const [calendarAreaSize, setCalendarAreaSize] = useState<{
+    width: number;
+    height: number;
+  }>({ width: 0, height: 0 });
+  const calendarAreaSizeRef = useRef<{ width: number; height: number }>({
+    width: 0,
+    height: 0,
+  });
+  const floatingCornerRef = useRef<FloatingCorner>('bottom-right');
+  const floatingPos = useRef(
+    new Animated.ValueXY({ x: FLOATING_EDGE_PADDING, y: FLOATING_EDGE_PADDING })
+  ).current;
+  const floatingCurrentXYRef = useRef<{ x: number; y: number }>({
+    x: FLOATING_EDGE_PADDING,
+    y: FLOATING_EDGE_PADDING,
+  });
+  const floatingDragOriginRef = useRef<{ x: number; y: number }>({
+    x: FLOATING_EDGE_PADDING,
+    y: FLOATING_EDGE_PADDING,
+  });
+  const floatingHasInitializedRef = useRef<boolean>(false);
+  const handleOpenFreeTimeFinderRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    const subId = floatingPos.addListener((val) => {
+      floatingCurrentXYRef.current = { x: val.x, y: val.y };
+    });
+    return () => {
+      floatingPos.removeListener(subId);
+    };
+  }, [floatingPos]);
+
+  const getCornerCoordinates = (
+    corner: FloatingCorner,
+    areaW: number,
+    areaH: number
+  ): { x: number; y: number } => {
+    const maxX = Math.max(
+      FLOATING_EDGE_PADDING,
+      areaW - FLOATING_BTN_SIZE - FLOATING_EDGE_PADDING
+    );
+    const maxY = Math.max(
+      FLOATING_EDGE_PADDING,
+      areaH - FLOATING_BTN_SIZE - FLOATING_EDGE_PADDING
+    );
+    switch (corner) {
+      case 'top-left':
+        return { x: FLOATING_EDGE_PADDING, y: FLOATING_EDGE_PADDING };
+      case 'top-right':
+        return { x: maxX, y: FLOATING_EDGE_PADDING };
+      case 'bottom-left':
+        return { x: FLOATING_EDGE_PADDING, y: maxY };
+      case 'bottom-right':
+      default:
+        return { x: maxX, y: maxY };
+    }
+  };
+
+  useEffect(() => {
+    if (calendarAreaSize.width <= 0 || calendarAreaSize.height <= 0) return;
+    calendarAreaSizeRef.current = calendarAreaSize;
+    const target = getCornerCoordinates(
+      floatingCornerRef.current,
+      calendarAreaSize.width,
+      calendarAreaSize.height
+    );
+    if (!floatingHasInitializedRef.current) {
+      floatingHasInitializedRef.current = true;
+      floatingPos.setValue(target);
+      floatingCurrentXYRef.current = target;
+    } else {
+      Animated.spring(floatingPos, {
+        toValue: target,
+        useNativeDriver: false,
+        bounciness: 5,
+        speed: 18,
+      }).start();
+    }
+  }, [calendarAreaSize.width, calendarAreaSize.height]);
+
+  const floatingBtnPanResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onStartShouldSetPanResponderCapture: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponderCapture: () => true,
+      onPanResponderGrant: () => {
+        floatingPos.stopAnimation((val) => {
+          floatingCurrentXYRef.current = { x: val.x, y: val.y };
+        });
+        floatingDragOriginRef.current = { ...floatingCurrentXYRef.current };
+      },
+      onPanResponderMove: (_, gestureState) => {
+        const areaW = calendarAreaSizeRef.current.width || 320;
+        const areaH = calendarAreaSizeRef.current.height || 480;
+        const minX = 4;
+        const minY = 4;
+        const maxX = Math.max(minX, areaW - FLOATING_BTN_SIZE - 4);
+        const maxY = Math.max(minY, areaH - FLOATING_BTN_SIZE - 4);
+
+        const nextX = Math.max(
+          minX,
+          Math.min(maxX, floatingDragOriginRef.current.x + gestureState.dx)
+        );
+        const nextY = Math.max(
+          minY,
+          Math.min(maxY, floatingDragOriginRef.current.y + gestureState.dy)
+        );
+        floatingPos.setValue({ x: nextX, y: nextY });
+      },
+      onPanResponderRelease: (_, gestureState) => {
+        const movedDistance = Math.hypot(gestureState.dx, gestureState.dy);
+        const areaW = calendarAreaSizeRef.current.width || 320;
+        const areaH = calendarAreaSizeRef.current.height || 480;
+
+        const projectedX =
+          floatingCurrentXYRef.current.x + gestureState.vx * 35;
+        const projectedY =
+          floatingCurrentXYRef.current.y + gestureState.vy * 35;
+
+        const corners: FloatingCorner[] = [
+          'top-left',
+          'top-right',
+          'bottom-left',
+          'bottom-right',
+        ];
+        let bestCorner: FloatingCorner = floatingCornerRef.current;
+        let bestDist = Infinity;
+        let bestCoords = getCornerCoordinates(bestCorner, areaW, areaH);
+
+        for (const c of corners) {
+          const coords = getCornerCoordinates(c, areaW, areaH);
+          const d = Math.hypot(coords.x - projectedX, coords.y - projectedY);
+          if (d < bestDist) {
+            bestDist = d;
+            bestCorner = c;
+            bestCoords = coords;
+          }
+        }
+
+        floatingCornerRef.current = bestCorner;
+        Animated.spring(floatingPos, {
+          toValue: bestCoords,
+          useNativeDriver: false,
+          bounciness: 6,
+          speed: 16,
+        }).start();
+
+        if (movedDistance < 8) {
+          handleOpenFreeTimeFinderRef.current();
+        }
+      },
+      onPanResponderTerminate: () => {
+        const areaW = calendarAreaSizeRef.current.width || 320;
+        const areaH = calendarAreaSizeRef.current.height || 480;
+        const coords = getCornerCoordinates(
+          floatingCornerRef.current,
+          areaW,
+          areaH
+        );
+        Animated.spring(floatingPos, {
+          toValue: coords,
+          useNativeDriver: false,
+          bounciness: 6,
+          speed: 16,
+        }).start();
+      },
+      onShouldBlockNativeResponder: () => true,
+    })
+  ).current;
 
   // Auto-Builder State
   const [autoSearchQuery, setAutoSearchQuery] = useState('');
@@ -485,7 +719,7 @@ export default function App() {
   const [customDay, setCustomDay] = useState<DayOfWeek>(0);
   const [customStart, setCustomStart] = useState('14');
   const [customEnd, setCustomEnd] = useState('17');
-  const [customColor, setCustomColor] = useState(COLOR_PALETTE[3]);
+  const [customColor, setCustomColor] = useState(DEFAULT_COLOR_PALETTE[3]);
   // null = "Create New Group"
   const [customAssignedRelationKey, setCustomAssignedRelationKey] = useState<
     string | null
@@ -547,6 +781,25 @@ export default function App() {
           if (typeof parsed.moodleIcalUrl === 'string') {
             setMoodleIcalUrl(parsed.moodleIcalUrl);
           }
+          if (typeof parsed.floatingFreeTime === 'boolean') {
+            setFloatingFreeTime(parsed.floatingFreeTime);
+          }
+          if (typeof parsed.myCoursesPinned === 'boolean') {
+            setMyCoursesPinned(parsed.myCoursesPinned);
+          }
+          if (
+            Array.isArray(parsed.customPalette) &&
+            parsed.customPalette.length === 8
+          ) {
+            setCustomPalette(parsed.customPalette);
+            setCustomColor(parsed.customPalette[4] || parsed.customPalette[0]);
+          }
+          if (typeof parsed.customPaletteBaseHex === 'string') {
+            setCustomPaletteBaseHex(parsed.customPaletteBaseHex);
+            if (parsed.customPaletteBaseHex) {
+              setCustomPaletteInput(parsed.customPaletteBaseHex);
+            }
+          }
         }
       } catch (err) {
         console.warn('Failed to load schedule state from AsyncStorage:', err);
@@ -580,6 +833,10 @@ export default function App() {
           includedSpecialGroups,
           autoOpenMoodleLogin,
           moodleIcalUrl,
+          floatingFreeTime,
+          myCoursesPinned,
+          customPaletteBaseHex,
+          customPalette: customPalette || undefined,
         };
         await AsyncStorage.setItem(ASYNC_STORAGE_KEY, JSON.stringify(payload));
       } catch (err) {
@@ -598,16 +855,59 @@ export default function App() {
     includedSpecialGroups,
     autoOpenMoodleLogin,
     moodleIcalUrl,
+    floatingFreeTime,
+    myCoursesPinned,
+    customPaletteBaseHex,
+    customPalette,
   ]);
 
-  // Automatically sync Cheesefork JS data when opening the Courses or Auto-Builder modal
+  // Feature 1: Automatic Startup Course Data Sync & Offline Caching
+  useEffect(() => {
+    let isMounted = true;
+
+    const initCourseCatalog = async () => {
+      try {
+        // 1. Immediately hydrate from local cache if available for instant startup/offline access
+        const cachedCourses = await loadCachedCheeseforkCatalog();
+        if (isMounted && cachedCourses.length > 0) {
+          setCatalog(cachedCourses);
+        }
+
+        // 2. Fetch latest live catalog in the background and update cache
+        if (isMounted) {
+          setLoadingLiveCatalog(true);
+        }
+        const { courses } = await syncCheeseforkCatalogWithCache();
+        if (isMounted && courses.length > 0) {
+          setCatalog(courses);
+        }
+      } catch (err) {
+        // Offline with no cache yet: fail gracefully without crashing or showing blocking alerts
+        console.warn(
+          'Offline or unable to reach Cheesefork on startup; using cached catalog if available.',
+          err
+        );
+      } finally {
+        if (isMounted) {
+          setLoadingLiveCatalog(false);
+        }
+      }
+    };
+
+    initCourseCatalog();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  // Also ensure catalog is synced if user opens Courses or Auto-Builder and catalog is still empty
   useEffect(() => {
     if (
       (searchModalVisible || autoBuilderModalVisible) &&
       catalog.length === 0 &&
       !loadingLiveCatalog
     ) {
-      handleSyncCheesefork();
+      handleSyncCheesefork(true);
     }
   }, [searchModalVisible, autoBuilderModalVisible]);
 
@@ -692,26 +992,53 @@ export default function App() {
     setCurrentWeekSunday(getStartOfWeekSunday(targetDate));
   };
 
-  // Collect all tracked course IDs from user's schedule state (`events` + `desiredCourseIds`)
+  // Collect all tracked/followed course IDs from user's schedule state (`events`, `desiredCourseIds`, and `tasks`)
   const trackedCourseIds = useMemo(() => {
     const ids = new Set<string>();
     for (const ev of events) {
-      if (ev.courseId) ids.add(ev.courseId);
+      if (ev.courseId) {
+        ids.add(ev.courseId);
+      } else if (ev.type !== 'Custom' && ev.title) {
+        const byTitle = catalog.find(
+          (c) => c.name.trim().toLowerCase() === ev.title.trim().toLowerCase()
+        );
+        if (byTitle) ids.add(byTitle.courseId);
+      }
     }
     for (const cid of desiredCourseIds) {
-      ids.add(cid);
+      if (cid) ids.add(cid);
+    }
+    for (const tsk of tasks) {
+      if (tsk.courseId) {
+        ids.add(tsk.courseId);
+      } else if (tsk.relationKey && tsk.relationKey.startsWith('course:')) {
+        const rawCid = tsk.relationKey.slice('course:'.length).trim();
+        if (rawCid) ids.add(rawCid);
+      }
     }
     return Array.from(ids);
-  }, [events, desiredCourseIds]);
+  }, [events, desiredCourseIds, tasks, catalog]);
 
   // Extract all exams (Moed A, Moed B, etc.) for tracked courses from the Cheesefork catalog
   const trackedExams = useMemo(() => {
     const examList: (CourseExam & { color: string })[] = [];
+    const seenCourseIds = new Set<string>();
     for (const cid of trackedCourseIds) {
-      const catalogCourse = catalog.find((c) => c.courseId === cid);
-      if (!catalogCourse || !catalogCourse.exams) continue;
+      const catalogCourse = catalog.find((c) =>
+        doesCourseIdMatch(c.courseId, cid)
+      );
+      if (
+        !catalogCourse ||
+        !catalogCourse.exams ||
+        seenCourseIds.has(catalogCourse.courseId)
+      ) {
+        continue;
+      }
+      seenCourseIds.add(catalogCourse.courseId);
 
-      const courseEvent = events.find((e) => e.courseId === cid);
+      const courseEvent = events.find((e) =>
+        doesCourseIdMatch(e.courseId, catalogCourse.courseId)
+      );
       const color = courseEvent ? courseEvent.color : '#DC2626';
 
       for (const ex of catalogCourse.exams) {
@@ -821,11 +1148,11 @@ export default function App() {
     for (const tsk of tasks) {
       if (!map.has(tsk.relationKey)) {
         const matchedEv = tsk.courseId
-          ? events.find((e) => e.courseId === tsk.courseId)
+          ? events.find((e) => doesCourseIdMatch(e.courseId, tsk.courseId))
           : undefined;
         const assignedColor = matchedEv
           ? matchedEv.color
-          : COLOR_PALETTE[fallbackColorIdx++ % COLOR_PALETTE.length];
+          : activeColorPalette[fallbackColorIdx++ % activeColorPalette.length];
         map.set(tsk.relationKey, {
           relationKey: tsk.relationKey,
           courseId: tsk.courseId,
@@ -839,7 +1166,7 @@ export default function App() {
     }
 
     return Array.from(map.values());
-  }, [events, tasks, hiddenKeys]);
+  }, [events, tasks, hiddenKeys, activeColorPalette]);
 
   // Helper to resolve the exact Course color for any task (matching its associated Course)
   const getTaskCourseColor = (tsk: CourseTask): string => {
@@ -849,16 +1176,18 @@ export default function App() {
     if (byRelation) return byRelation.color;
 
     if (tsk.courseId) {
-      const byCourseId = activeCourseItems.find(
-        (item) => item.courseId === tsk.courseId
+      const byCourseId = activeCourseItems.find((item) =>
+        doesCourseIdMatch(item.courseId, tsk.courseId)
       );
       if (byCourseId) return byCourseId.color;
 
-      const evByCourse = events.find((e) => e.courseId === tsk.courseId);
+      const evByCourse = events.find((e) =>
+        doesCourseIdMatch(e.courseId, tsk.courseId)
+      );
       if (evByCourse) return evByCourse.color;
     }
 
-    return COLOR_PALETTE[0];
+    return activeColorPalette[0];
   };
 
   // Compute active tasks falling within the currently viewed week (pinned at top of day column & on grid)
@@ -1237,6 +1566,10 @@ export default function App() {
         includedSpecialGroups,
         autoOpenMoodleLogin,
         moodleIcalUrl,
+        floatingFreeTime,
+        myCoursesPinned,
+        customPaletteBaseHex,
+        customPalette: customPalette || undefined,
       };
       await AsyncStorage.setItem(ASYNC_STORAGE_KEY, JSON.stringify(payload));
     } catch (err) {
@@ -1267,6 +1600,10 @@ export default function App() {
         includedSpecialGroups,
         autoOpenMoodleLogin,
         moodleIcalUrl,
+        floatingFreeTime,
+        myCoursesPinned,
+        customPaletteBaseHex,
+        customPalette: customPalette || undefined,
       };
 
       const jsonText = JSON.stringify(payload, null, 2);
@@ -1336,6 +1673,22 @@ export default function App() {
         typeof parsed.moodleIcalUrl === 'string'
           ? parsed.moodleIcalUrl
           : moodleIcalUrl;
+      const nextFloatingFreeTime =
+        typeof parsed.floatingFreeTime === 'boolean'
+          ? parsed.floatingFreeTime
+          : floatingFreeTime;
+      const nextMyCoursesPinned =
+        typeof parsed.myCoursesPinned === 'boolean'
+          ? parsed.myCoursesPinned
+          : myCoursesPinned;
+      const nextCustomPaletteBaseHex =
+        typeof parsed.customPaletteBaseHex === 'string'
+          ? parsed.customPaletteBaseHex
+          : customPaletteBaseHex;
+      const nextCustomPalette =
+        Array.isArray(parsed.customPalette) && parsed.customPalette.length === 8
+          ? parsed.customPalette
+          : customPalette;
 
       setEvents(incomingEvents);
       setTasks(incomingTasks);
@@ -1345,6 +1698,13 @@ export default function App() {
       setIncludedSpecialGroups(nextSpecialGroups);
       setAutoOpenMoodleLogin(nextAutoOpenMoodle);
       setMoodleIcalUrl(nextMoodleIcalUrl);
+      setFloatingFreeTime(nextFloatingFreeTime);
+      setMyCoursesPinned(nextMyCoursesPinned);
+      setCustomPaletteBaseHex(nextCustomPaletteBaseHex);
+      if (nextCustomPaletteBaseHex) {
+        setCustomPaletteInput(nextCustomPaletteBaseHex);
+      }
+      setCustomPalette(nextCustomPalette);
 
       const restoredPayload: LocalBackupPayload = {
         version: 1,
@@ -1357,6 +1717,10 @@ export default function App() {
         includedSpecialGroups: nextSpecialGroups,
         autoOpenMoodleLogin: nextAutoOpenMoodle,
         moodleIcalUrl: nextMoodleIcalUrl,
+        floatingFreeTime: nextFloatingFreeTime,
+        myCoursesPinned: nextMyCoursesPinned,
+        customPaletteBaseHex: nextCustomPaletteBaseHex,
+        customPalette: nextCustomPalette || undefined,
       };
       await AsyncStorage.setItem(
         ASYNC_STORAGE_KEY,
@@ -1381,30 +1745,76 @@ export default function App() {
     }
   };
 
-  // "Free Time" Spontaneous Finder ("יש לי זמן פנוי")
-  const handleOpenFreeTimeFinder = () => {
-    const now = new Date();
-    setFreeTimeCheckedAt(now);
-
-    const currentDay = now.getDay(); // 0 = Sun .. 6 = Sat
-    const currentDecHour = now.getHours() + now.getMinutes() / 60;
+  // Feature 2: "Free Time" Spontaneous Finder ("יש לי זמן פנוי")
+  // Automatically includes ALL session components (lectures, tutorials/recitations, labs)
+  // of every followed course, even if the user only follows a single lecture or tutorial.
+  const computeSpontaneousEventsForCatalog = (
+    activeCatalog: CourseCatalogItem[],
+    refDate: Date
+  ): SpontaneousEventItem[] => {
+    const currentDay = refDate.getDay(); // 0 = Sun .. 6 = Sat
+    const currentDecHour = refDate.getHours() + refDate.getMinutes() / 60;
     const windowEndHour = currentDecHour + 2.0;
 
     const results: SpontaneousEventItem[] = [];
     const seenKeys = new Set<string>();
 
-    // 1. Check all catalog groups of the user's tracked courses (merged identical groups)
+    // Resolve all followed catalog courses (matched by courseId, 6/8-digit variants, or course title)
+    const followedCoursesMap = new Map<string, CourseCatalogItem>();
     for (const cid of trackedCourseIds) {
-      const course = catalog.find((c) => c.courseId === cid);
-      if (!course) continue;
-
-      const userEvForCourse = events.find((e) => e.courseId === cid);
-      const color = userEvForCourse ? userEvForCourse.color : '#2563EB';
-
-      const allowedGroups = course.groups.filter((g) =>
-        isGroupAllowedByFilters(g.groupId, includedSpecialGroups)
+      const matched = activeCatalog.find((c) =>
+        doesCourseIdMatch(c.courseId, cid)
       );
-      const mergedGroups = mergeIdenticalCourseGroups(allowedGroups);
+      if (matched) {
+        followedCoursesMap.set(matched.courseId, matched);
+      }
+    }
+    for (const ev of events) {
+      if (ev.type === 'Custom' && !ev.courseId) continue;
+      const matched = activeCatalog.find(
+        (c) =>
+          doesCourseIdMatch(c.courseId, ev.courseId) ||
+          (ev.title &&
+            c.name.trim().toLowerCase() === ev.title.trim().toLowerCase())
+      );
+      if (matched) {
+        followedCoursesMap.set(matched.courseId, matched);
+      }
+    }
+
+    // 1. For every followed course, inspect ALL associated session types (Lecture, Tutorial, Lab)
+    for (const course of followedCoursesMap.values()) {
+      const userEvForCourse = events.find(
+        (e) =>
+          doesCourseIdMatch(e.courseId, course.courseId) ||
+          (e.title &&
+            e.title.trim().toLowerCase() === course.name.trim().toLowerCase())
+      );
+      const color = userEvForCourse
+        ? userEvForCourse.color
+        : activeColorPalette[0];
+
+      // Include all session types (Lectures, Tutorials/Recitations, Labs);
+      // apply special group filters per session type, falling back to unfiltered groups
+      // of that type if filters would otherwise hide all tutorials/lectures.
+      const sessionTypes: Array<'Lecture' | 'Tutorial' | 'Lab'> = [
+        'Lecture',
+        'Tutorial',
+        'Lab',
+      ];
+      const candidateGroups: CourseCatalogItem['groups'] = [];
+      for (const sType of sessionTypes) {
+        const groupsOfType = course.groups.filter((g) => g.type === sType);
+        if (groupsOfType.length === 0) continue;
+        const allowedOfType = groupsOfType.filter((g) =>
+          isGroupAllowedByFilters(g.groupId, includedSpecialGroups)
+        );
+        candidateGroups.push(
+          ...(allowedOfType.length > 0 ? allowedOfType : groupsOfType)
+        );
+      }
+
+      const mergedGroups = mergeIdenticalCourseGroups(candidateGroups);
 
       for (const grp of mergedGroups) {
         for (const sess of grp.sessions) {
@@ -1413,7 +1823,7 @@ export default function App() {
             sess.startHour >= currentDecHour &&
             sess.startHour <= windowEndHour
           ) {
-            const dedupeKey = `${cid}-${grp.type}-${grp.groupId}-${sess.day}-${sess.startHour}`;
+            const dedupeKey = `${course.courseId}-${grp.type}-${grp.groupId}-${sess.day}-${sess.startHour}`;
             if (seenKeys.has(dedupeKey)) continue;
             seenKeys.add(dedupeKey);
 
@@ -1439,17 +1849,24 @@ export default function App() {
       }
     }
 
-    // 2. Also check events directly in the user's schedule state
+    // 2. Also check events directly in the user's schedule state (in case offline with no catalog)
     for (const ev of events) {
-      if (ev.type === 'Custom' || ev.type === 'Exam') continue;
+      if (ev.type === 'Custom' || ev.type === 'Exam' || ev.type === 'Task') {
+        continue;
+      }
       if (
         ev.day === currentDay &&
         ev.startHour >= currentDecHour &&
         ev.startHour <= windowEndHour
       ) {
-        const dedupeKey = `${ev.courseId || ev.title}-${ev.type}-${
-          ev.groupId || ''
-        }-${ev.day}-${ev.startHour}`;
+        const matchedCatalogCourse = activeCatalog.find((c) =>
+          doesCourseIdMatch(c.courseId, ev.courseId)
+        );
+        const canonicalCid =
+          matchedCatalogCourse?.courseId || ev.courseId || ev.title;
+        const dedupeKey = `${canonicalCid}-${ev.type}-${ev.groupId || ''}-${
+          ev.day
+        }-${ev.startHour}`;
         if (seenKeys.has(dedupeKey)) continue;
         seenKeys.add(dedupeKey);
 
@@ -1474,9 +1891,36 @@ export default function App() {
     }
 
     results.sort((a, b) => a.minutesUntilStart - b.minutesUntilStart);
-    setSpontaneousEvents(results);
+    return results;
+  };
+
+  const handleOpenFreeTimeFinder = async () => {
+    const now = new Date();
+    setFreeTimeCheckedAt(now);
+
+    let activeCatalog = catalog;
+    if (activeCatalog.length === 0) {
+      const cached = await loadCachedCheeseforkCatalog();
+      if (cached.length > 0) {
+        activeCatalog = cached;
+        setCatalog(cached);
+      } else {
+        handleSyncCheesefork(true);
+      }
+    }
+
+    setSpontaneousEvents(computeSpontaneousEventsForCatalog(activeCatalog, now));
     setFreeTimeModalVisible(true);
   };
+  handleOpenFreeTimeFinderRef.current = handleOpenFreeTimeFinder;
+
+  // Re-compute Free Time results automatically if catalog finishes loading while modal is open
+  useEffect(() => {
+    if (!freeTimeModalVisible || !freeTimeCheckedAt) return;
+    setSpontaneousEvents(
+      computeSpontaneousEventsForCatalog(catalog, freeTimeCheckedAt)
+    );
+  }, [freeTimeModalVisible, catalog, events, trackedCourseIds, includedSpecialGroups]);
 
   // Handle Single Tap (Highlight) vs Double Tap (Visibility Toggle: isHidden) on "My Courses" items
   const handleMyCourseItemPress = (relationKey: string) => {
@@ -1517,24 +1961,106 @@ export default function App() {
     }));
   };
 
-  // Fetch & parse https://sap.cheesefork.cf/courses_2026_200.min.js
-  const handleSyncCheesefork = async () => {
+  // Fetch, parse & cache https://sap.cheesefork.cf/courses_2026_200.min.js with offline fallback
+  const handleSyncCheesefork = async (silent = false) => {
     try {
       setLoadingLiveCatalog(true);
-      const liveCourses = await fetchCheeseforkCatalog();
-      setCatalog(liveCourses);
-      Alert.alert(
-        'Cheesefork Synced',
-        `Loaded ${liveCourses.length} Technion courses (with exam dates) from live Cheesefork data.`
-      );
+      const { courses: syncedCourses, fromCache } =
+        await syncCheeseforkCatalogWithCache();
+      setCatalog(syncedCourses);
+      if (!silent) {
+        if (fromCache) {
+          Alert.alert(
+            'Loaded Offline Cache',
+            `You appear to be offline. Loaded ${syncedCourses.length} cached Technion courses.`
+          );
+        } else {
+          Alert.alert(
+            'Cheesefork Synced',
+            `Loaded ${syncedCourses.length} Technion courses (with exam dates) from live Cheesefork data.`
+          );
+        }
+      }
     } catch (err: any) {
-      Alert.alert(
-        'Sync Error',
-        err.message || 'Could not fetch Cheesefork JS course data.'
-      );
+      if (!silent) {
+        Alert.alert(
+          'Sync Error',
+          err?.message || 'Could not fetch Cheesefork JS course data.'
+        );
+      }
     } finally {
       setLoadingLiveCatalog(false);
     }
+  };
+
+  // Feature 6: Custom Palette Generator (HSL ±15° hue steps with constant S & L)
+  const applyPaletteToScheduleEvents = (nextPalette: string[]) => {
+    if (!nextPalette || nextPalette.length === 0) return;
+    setEvents((prev) => {
+      const keyColorMap = new Map<string, string>();
+      let colorCounter = 0;
+      return prev.map((ev) => {
+        if (ev.type === 'Exam') return ev;
+        const key = getEventRelationKey(ev);
+        if (!keyColorMap.has(key)) {
+          keyColorMap.set(
+            key,
+            nextPalette[colorCounter % nextPalette.length]
+          );
+          colorCounter += 1;
+        }
+        return {
+          ...ev,
+          color: keyColorMap.get(key)!,
+        };
+      });
+    });
+    setCustomColor(nextPalette[4] || nextPalette[0]);
+  };
+
+  const handleApplyCustomPaletteBase = (rawHex: string) => {
+    setCustomPaletteInput(rawHex);
+    const normalized = normalizeHexColor(rawHex);
+    if (!normalized) {
+      showToastNotification(
+        'Please enter a valid HEX color (e.g. #3B82F6).',
+        'warning'
+      );
+      return;
+    }
+    const generated = generateCustomPaletteFromHex(normalized);
+    if (!generated || generated.length !== 8) return;
+
+    setCustomPaletteBaseHex(normalized);
+    setCustomPaletteInput(normalized);
+    setCustomPalette(generated);
+    applyPaletteToScheduleEvents(generated);
+    showToastNotification(
+      `Applied 8-color custom palette from ${normalized}`,
+      'success'
+    );
+  };
+
+  const handleCustomPaletteTextChange = (text: string) => {
+    setCustomPaletteInput(text);
+    const cleaned = text.trim().replace(/^#/, '');
+    if (/^[0-9A-Fa-f]{6}$/.test(cleaned)) {
+      const normalized = `#${cleaned.toUpperCase()}`;
+      const generated = generateCustomPaletteFromHex(normalized);
+      if (generated && generated.length === 8) {
+        setCustomPaletteBaseHex(normalized);
+        setCustomPalette(generated);
+        applyPaletteToScheduleEvents(generated);
+      }
+    }
+  };
+
+  const handleResetCustomPalette = () => {
+    setCustomPaletteBaseHex('');
+    setCustomPalette(null);
+    setCustomPaletteInput('#3B82F6');
+    applyPaletteToScheduleEvents(DEFAULT_COLOR_PALETTE);
+    showToastNotification('Reset to default 8-color palette', 'success');
   };
 
   const toggleExpandCourse = (courseId: string) => {
@@ -1769,7 +2295,7 @@ export default function App() {
     const options = generateAutoSchedules(
       selectedCourses,
       lockedEvents,
-      COLOR_PALETTE,
+      activeColorPalette,
       2
     );
     setGeneratedOptions(options);
@@ -1942,15 +2468,17 @@ export default function App() {
                 <Text style={styles.spoonMenuItemText}>📝 Task</Text>
               </TouchableOpacity>
 
-              <TouchableOpacity
-                style={styles.spoonMenuItem}
-                onPress={() => {
-                  setSpoonMenuVisible(false);
-                  handleOpenFreeTimeFinder();
-                }}
-              >
-                <Text style={styles.spoonMenuItemText}>🕒 Free Time</Text>
-              </TouchableOpacity>
+              {!floatingFreeTime && (
+                <TouchableOpacity
+                  style={styles.spoonMenuItem}
+                  onPress={() => {
+                    setSpoonMenuVisible(false);
+                    handleOpenFreeTimeFinder();
+                  }}
+                >
+                  <Text style={styles.spoonMenuItemText}>🕒 Free Time</Text>
+                </TouchableOpacity>
+              )}
 
               <TouchableOpacity
                 style={[styles.spoonMenuItem, { borderBottomWidth: 0 }]}
@@ -2048,7 +2576,143 @@ export default function App() {
                   </View>
                 </View>
 
-                {/* SECTION 2: SCHEDULE BACKUP (JSON IMPORT / EXPORT) */}
+                {/* SECTION 2: INTERFACE & CUSTOM PALETTE */}
+                <Text style={styles.settingsSectionLabel}>
+                  INTERFACE & APPEARANCE
+                </Text>
+                <View style={styles.settingsGroupBox}>
+                  {/* Feature 3: "Floating free time" Toggle */}
+                  <View style={styles.settingsOptionRow}>
+                    <Text
+                      style={[
+                        styles.settingsOptionText,
+                        styles.settingsToggleLabelText,
+                      ]}
+                    >
+                      Floating free time
+                    </Text>
+                    <Switch
+                      value={floatingFreeTime}
+                      onValueChange={setFloatingFreeTime}
+                      trackColor={{ false: '#374151', true: '#2563EB' }}
+                      thumbColor={floatingFreeTime ? '#FFFFFF' : '#9CA3AF'}
+                    />
+                  </View>
+
+                  {/* Feature 6: "Custom Palette" Generator */}
+                  <View style={styles.settingsPaletteContainer}>
+                    <View style={styles.settingsPaletteHeaderRow}>
+                      <View>
+                        <Text style={styles.settingsOptionText}>
+                          🎨 Custom Palette
+                        </Text>
+                        <Text style={styles.settingsPaletteSubText}>
+                          Base HEX → 8 HSL hues (-60° to +45° in 15° steps)
+                        </Text>
+                      </View>
+                      {customPalette && (
+                        <TouchableOpacity
+                          style={styles.settingsPaletteResetBtn}
+                          onPress={handleResetCustomPalette}
+                        >
+                          <Text style={styles.settingsPaletteResetText}>
+                            Reset
+                          </Text>
+                        </TouchableOpacity>
+                      )}
+                    </View>
+
+                    <View style={styles.settingsPaletteInputRow}>
+                      <View
+                        style={[
+                          styles.settingsPaletteCurrentDot,
+                          {
+                            backgroundColor:
+                              normalizeHexColor(customPaletteInput) ||
+                              customPaletteBaseHex ||
+                              activeColorPalette[4] ||
+                              '#3B82F6',
+                          },
+                        ]}
+                      />
+                      <TextInput
+                        style={styles.settingsPaletteHexInput}
+                        value={customPaletteInput}
+                        onChangeText={handleCustomPaletteTextChange}
+                        placeholder="#3B82F6"
+                        placeholderTextColor="#6B7280"
+                        autoCapitalize="characters"
+                        autoCorrect={false}
+                        maxLength={7}
+                      />
+                      <TouchableOpacity
+                        style={styles.settingsPaletteApplyBtn}
+                        onPress={() =>
+                          handleApplyCustomPaletteBase(customPaletteInput)
+                        }
+                      >
+                        <Text style={styles.settingsPaletteApplyBtnText}>
+                          Generate
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+
+                    {/* Quick Base Color Presets */}
+                    <View style={styles.settingsPaletteQuickRow}>
+                      {DEFAULT_COLOR_PALETTE.map((presetHex) => (
+                        <TouchableOpacity
+                          key={`preset-${presetHex}`}
+                          onPress={() => handleApplyCustomPaletteBase(presetHex)}
+                          style={[
+                            styles.settingsPaletteQuickDot,
+                            { backgroundColor: presetHex },
+                            customPaletteBaseHex === presetHex &&
+                              styles.settingsPaletteQuickDotSelected,
+                          ]}
+                        />
+                      ))}
+                    </View>
+
+                    {/* Live 8-Color Generated Palette Preview */}
+                    <Text style={styles.settingsPalettePreviewTitle}>
+                      Live 8-Color Palette Preview:
+                    </Text>
+                    <View style={styles.settingsPalettePreviewRow}>
+                      {activeColorPalette.map((hex, idx) => {
+                        const degOffset = -60 + idx * 15;
+                        const degLabel =
+                          degOffset > 0 ? `+${degOffset}°` : `${degOffset}°`;
+                        return (
+                          <View
+                            key={`${hex}-${idx}`}
+                            style={styles.settingsPalettePreviewItem}
+                          >
+                            <View
+                              style={[
+                                styles.settingsPalettePreviewSwatch,
+                                { backgroundColor: hex },
+                                degOffset === 0 &&
+                                  Boolean(customPalette) &&
+                                  styles.settingsPalettePreviewSwatchBase,
+                              ]}
+                            />
+                            <Text style={styles.settingsPalettePreviewDeg}>
+                              {degLabel}
+                            </Text>
+                            <Text
+                              style={styles.settingsPalettePreviewHex}
+                              numberOfLines={1}
+                            >
+                              {hex}
+                            </Text>
+                          </View>
+                        );
+                      })}
+                    </View>
+                  </View>
+                </View>
+
+                {/* SECTION 3: SCHEDULE BACKUP (JSON IMPORT / EXPORT) */}
                 <Text style={styles.settingsSectionLabel}>
                   SCHEDULE DATA & BACKUP
                 </Text>
@@ -2192,17 +2856,32 @@ export default function App() {
             isLandscape && styles.contentContainerLandscape,
           ]}
         >
-          {/* MAIN CALENDAR AREA WITH SWIPE GESTURES, SLIDE ANIMATION & VERTICAL PINCH-TO-ZOOM */}
-          <Animated.View
-            style={[
-              styles.calendarMainArea,
-              {
-                transform: [{ translateX: weekSlideAnim }],
-                opacity: weekOpacityAnim,
-              },
-            ]}
-            {...pinchPanResponder.panHandlers}
+          {/* CALENDAR VIEWPORT WRAPPER (Holds week-sliding calendar + optional magnetized floating Free Time button) */}
+          <View
+            style={styles.calendarViewportWrapper}
+            onLayout={(e) => {
+              const { width: w, height: h } = e.nativeEvent.layout;
+              if (
+                w > 0 &&
+                h > 0 &&
+                (Math.abs(w - calendarAreaSize.width) > 1 ||
+                  Math.abs(h - calendarAreaSize.height) > 1)
+              ) {
+                setCalendarAreaSize({ width: w, height: h });
+              }
+            }}
           >
+            {/* MAIN CALENDAR AREA WITH SWIPE GESTURES, SLIDE ANIMATION & VERTICAL PINCH-TO-ZOOM */}
+            <Animated.View
+              style={[
+                styles.calendarMainArea,
+                {
+                  transform: [{ translateX: weekSlideAnim }],
+                  opacity: weekOpacityAnim,
+                },
+              ]}
+              {...pinchPanResponder.panHandlers}
+            >
             {/* FEATURE 1: RTL DATE-AWARE DAY HEADERS + PINNED ALL-DAY COURSE TASKS (Thu on left ... Sun on far right) */}
             <View style={styles.dayHeaderRow}>
               <View style={styles.timeGutterHeader} />
@@ -2423,19 +3102,60 @@ export default function App() {
                 )}
               </View>
             </ScrollView>
-          </Animated.View>
+            </Animated.View>
+
+            {/* Feature 3: Draggable & 4-Corner Magnetized Floating "Free Time" Button (Clock Emoji Only) */}
+            {floatingFreeTime && (
+              <Animated.View
+                {...floatingBtnPanResponder.panHandlers}
+                style={[
+                  styles.floatingFreeTimeBtn,
+                  {
+                    transform: [
+                      { translateX: floatingPos.x },
+                      { translateY: floatingPos.y },
+                    ],
+                  },
+                ]}
+              >
+                <Text style={styles.floatingFreeTimeEmoji}>🕒</Text>
+              </Animated.View>
+            )}
+          </View>
 
           {/* MY COURSES SECTION (Bottom in Portrait, Side Panel in Landscape) */}
           <View
             style={[
               styles.myCoursesSection,
+              !myCoursesPinned && !isLandscape && styles.myCoursesSectionCompact,
               isLandscape && styles.myCoursesSectionLandscape,
             ]}
           >
             <View style={styles.myCoursesHeader}>
-              <Text style={styles.myCoursesTitle}>
-                My Courses ({activeCourseItems.length}) • Tasks ({tasks.length})
-              </Text>
+              <View style={styles.myCoursesTitleRow}>
+                <TouchableOpacity
+                  style={[
+                    styles.pinToggleBtn,
+                    myCoursesPinned
+                      ? styles.pinToggleBtnActive
+                      : styles.pinToggleBtnInactive,
+                  ]}
+                  activeOpacity={0.75}
+                  onPress={() => setMyCoursesPinned((prev) => !prev)}
+                >
+                  <Text
+                    style={[
+                      styles.pinToggleIcon,
+                      !myCoursesPinned && styles.pinToggleIconUnpinned,
+                    ]}
+                  >
+                    📌
+                  </Text>
+                </TouchableOpacity>
+                <Text style={styles.myCoursesTitle}>
+                  My Courses ({activeCourseItems.length}) • Tasks ({tasks.length})
+                </Text>
+              </View>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
                 {activeCourseItems.length > 0 && (
                   <TouchableOpacity onPress={() => handleOpenTaskModal()}>
@@ -2472,13 +3192,67 @@ export default function App() {
                 {activeCourseItems.map((item) => {
                   const isSelected = highlightedKey === item.relationKey;
                   const courseExams = item.courseId
-                    ? trackedExams.filter((ex) => ex.courseId === item.courseId)
+                    ? trackedExams.filter((ex) =>
+                        doesCourseIdMatch(ex.courseId, item.courseId)
+                      )
                     : [];
                   const courseTasks = tasks.filter(
                     (t) =>
                       t.relationKey === item.relationKey ||
-                      (item.courseId && t.courseId === item.courseId)
+                      (item.courseId &&
+                        doesCourseIdMatch(t.courseId, item.courseId))
                   );
+
+                  if (!myCoursesPinned) {
+                    // Unpinned Minimal View: Course/Group Name + Number of Tasks only
+                    return (
+                      <TouchableOpacity
+                        key={item.relationKey}
+                        activeOpacity={0.8}
+                        onPress={() => handleMyCourseItemPress(item.relationKey)}
+                        style={[
+                          styles.myCoursePill,
+                          styles.myCoursePillMinimal,
+                          isLandscape && styles.myCoursePillLandscape,
+                          { borderLeftColor: item.color },
+                          isSelected && styles.myCoursePillSelected,
+                          item.isHidden && styles.myCoursePillHidden,
+                        ]}
+                      >
+                        <View style={styles.myCourseMinimalRow}>
+                          <Text
+                            style={[
+                              styles.myCourseName,
+                              isSelected && { color: '#1D4ED8' },
+                              item.isHidden && styles.textStrikethrough,
+                            ]}
+                            numberOfLines={1}
+                          >
+                            {item.title}
+                          </Text>
+                          <View
+                            style={[
+                              styles.myCourseTaskCountBadge,
+                              courseTasks.length > 0 && {
+                                backgroundColor: '#DBEAFE',
+                                borderColor: '#93C5FD',
+                              },
+                            ]}
+                          >
+                            <Text
+                              style={[
+                                styles.myCourseTaskCountText,
+                                courseTasks.length > 0 && { color: '#1D4ED8' },
+                              ]}
+                            >
+                              {courseTasks.length}{' '}
+                              {courseTasks.length === 1 ? 'task' : 'tasks'}
+                            </Text>
+                          </View>
+                        </View>
+                      </TouchableOpacity>
+                    );
+                  }
 
                   return (
                     <TouchableOpacity
@@ -2601,7 +3375,11 @@ export default function App() {
         </View>
 
         {/* MODAL 1: COURSE SEARCH, MERGED IDENTICAL GROUPS, SPECIAL FILTERS & AI RATINGS */}
-        <Modal visible={searchModalVisible} animationType="slide">
+        <Modal
+          visible={searchModalVisible}
+          animationType="slide"
+          onRequestClose={() => setSearchModalVisible(false)}
+        >
           <SafeAreaProvider>
             <SafeAreaView
               style={styles.modalContainer}
@@ -2612,7 +3390,7 @@ export default function App() {
                 <View style={{ flexDirection: 'row', gap: 12, alignItems: 'center' }}>
                   <TouchableOpacity
                     style={[styles.btn, { backgroundColor: '#F59E0B' }]}
-                    onPress={handleSyncCheesefork}
+                    onPress={() => handleSyncCheesefork(false)}
                     disabled={loadingLiveCatalog}
                   >
                     <Text style={styles.btnText}>
@@ -2801,8 +3579,8 @@ export default function App() {
                                             toggleCourseGroup(
                                               course,
                                               grp,
-                                              COLOR_PALETTE[
-                                                cIdx % COLOR_PALETTE.length
+                                              activeColorPalette[
+                                                cIdx % activeColorPalette.length
                                               ]
                                             )
                                           }
@@ -2833,7 +3611,12 @@ export default function App() {
         </Modal>
 
         {/* MODAL 2: EVENT INSPECTOR (COLOR SYNC + TWO DISTINCT REMOVAL OPTIONS) */}
-        <Modal visible={!!selectedEvent} transparent animationType="fade">
+        <Modal
+          visible={!!selectedEvent}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setSelectedEvent(null)}
+        >
           <View style={styles.modalBackdrop}>
             {selectedEvent && (
               <View style={styles.inspectorCard}>
@@ -2872,7 +3655,7 @@ export default function App() {
                       Block Color (Syncs to all related events):
                     </Text>
                     <View style={styles.colorRow}>
-                      {COLOR_PALETTE.map((hex) => (
+                      {activeColorPalette.map((hex) => (
                         <TouchableOpacity
                           key={hex}
                           onPress={() => updateEventColor(selectedEvent, hex)}
@@ -2917,7 +3700,12 @@ export default function App() {
         </Modal>
 
         {/* MODAL 3: ADD CUSTOM EVENT (PRE-FILLED BY TAP-TO-CREATE OR MANUAL) */}
-        <Modal visible={customModalVisible} transparent animationType="slide">
+        <Modal
+          visible={customModalVisible}
+          transparent
+          animationType="slide"
+          onRequestClose={() => setCustomModalVisible(false)}
+        >
           <View style={styles.modalBackdrop}>
             <View style={styles.inspectorCard}>
               <Text style={styles.inspectorTitle}>Add Custom Event</Text>
@@ -3051,7 +3839,7 @@ export default function App() {
                 <>
                   <Text style={styles.sectionLabel}>New Group Color:</Text>
                   <View style={styles.colorRow}>
-                    {COLOR_PALETTE.map((hex) => (
+                    {activeColorPalette.map((hex) => (
                       <TouchableOpacity
                         key={hex}
                         onPress={() => setCustomColor(hex)}
@@ -3085,7 +3873,11 @@ export default function App() {
         </Modal>
 
         {/* MODAL 4: AUTOMATIC SCHEDULE BUILDER (BACKTRACKING SOLVER) */}
-        <Modal visible={autoBuilderModalVisible} animationType="slide">
+        <Modal
+          visible={autoBuilderModalVisible}
+          animationType="slide"
+          onRequestClose={() => setAutoBuilderModalVisible(false)}
+        >
           <SafeAreaProvider>
             <SafeAreaView
               style={styles.modalContainer}
@@ -3381,7 +4173,12 @@ export default function App() {
         </Modal>
 
         {/* MODAL 5: "I HAVE FREE TIME" (יש לי זמן פנוי) SPONTANEOUS FINDER */}
-        <Modal visible={freeTimeModalVisible} transparent animationType="slide">
+        <Modal
+          visible={freeTimeModalVisible}
+          transparent
+          animationType="slide"
+          onRequestClose={() => setFreeTimeModalVisible(false)}
+        >
           <View style={styles.bottomSheetBackdrop}>
             <View style={styles.bottomSheetCard}>
               <View style={styles.modalHeader}>
@@ -3471,7 +4268,12 @@ export default function App() {
         </Modal>
 
         {/* MODAL 6: FEATURE 4 — CREATE TASK / ASSIGNMENT (מטלה) LINKED TO COURSE GROUP */}
-        <Modal visible={taskModalVisible} transparent animationType="slide">
+        <Modal
+          visible={taskModalVisible}
+          transparent
+          animationType="slide"
+          onRequestClose={() => setTaskModalVisible(false)}
+        >
           <View style={styles.modalBackdrop}>
             <View style={styles.inspectorCard}>
               <Text style={styles.inspectorTitle}>📌 Add Course Task (מטלה)</Text>
@@ -4004,9 +4806,36 @@ const styles = StyleSheet.create({
   contentContainerLandscape: {
     flexDirection: 'row',
   },
+  calendarViewportWrapper: {
+    flex: 1,
+    position: 'relative',
+    overflow: 'hidden',
+  },
   calendarMainArea: {
     flex: 1,
     position: 'relative',
+  },
+  floatingFreeTimeBtn: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    width: FLOATING_BTN_SIZE,
+    height: FLOATING_BTN_SIZE,
+    borderRadius: FLOATING_BTN_SIZE / 2,
+    backgroundColor: '#1F2937',
+    borderWidth: 2,
+    borderColor: '#3B82F6',
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 10,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.35,
+    shadowRadius: 6,
+    zIndex: 50,
+  },
+  floatingFreeTimeEmoji: {
+    fontSize: 24,
   },
   header: {
     flexDirection: 'row',
@@ -4154,6 +4983,124 @@ const styles = StyleSheet.create({
     color: '#6B7280',
     fontSize: 18,
     fontWeight: '700',
+  },
+  settingsPaletteContainer: {
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  settingsPaletteHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  settingsPaletteSubText: {
+    color: '#9CA3AF',
+    fontSize: 11,
+    marginTop: 2,
+  },
+  settingsPaletteResetBtn: {
+    backgroundColor: '#374151',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 6,
+  },
+  settingsPaletteResetText: {
+    color: '#E5E7EB',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  settingsPaletteInputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 10,
+  },
+  settingsPaletteCurrentDot: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    borderWidth: 2,
+    borderColor: '#F9FAFB',
+  },
+  settingsPaletteHexInput: {
+    flex: 1,
+    backgroundColor: '#1F2937',
+    color: '#F9FAFB',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#374151',
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  settingsPaletteApplyBtn: {
+    backgroundColor: '#2563EB',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  settingsPaletteApplyBtnText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  settingsPaletteQuickRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 10,
+    flexWrap: 'wrap',
+  },
+  settingsPaletteQuickDot: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    borderColor: 'rgba(255,255,255,0.35)',
+  },
+  settingsPaletteQuickDotSelected: {
+    borderWidth: 2.5,
+    borderColor: '#FFFFFF',
+  },
+  settingsPalettePreviewTitle: {
+    color: '#9CA3AF',
+    fontSize: 11,
+    fontWeight: '700',
+    marginBottom: 6,
+  },
+  settingsPalettePreviewRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 4,
+  },
+  settingsPalettePreviewItem: {
+    flex: 1,
+    alignItems: 'center',
+  },
+  settingsPalettePreviewSwatch: {
+    width: '100%',
+    height: 26,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.25)',
+  },
+  settingsPalettePreviewSwatchBase: {
+    borderWidth: 2,
+    borderColor: '#FFFFFF',
+  },
+  settingsPalettePreviewDeg: {
+    color: '#9CA3AF',
+    fontSize: 9,
+    fontWeight: '700',
+    marginTop: 3,
+  },
+  settingsPalettePreviewHex: {
+    color: '#D1D5DB',
+    fontSize: 7.5,
+    fontWeight: '600',
+    marginTop: 1,
   },
   settingsQuickToolsGrid: {
     flexDirection: 'row',
@@ -4432,6 +5379,9 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     paddingHorizontal: 12,
   },
+  myCoursesSectionCompact: {
+    paddingVertical: 6,
+  },
   myCoursesSectionLandscape: {
     width: 250,
     borderTopWidth: 0,
@@ -4445,6 +5395,58 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
     marginBottom: 8,
+  },
+  myCoursesTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+  },
+  pinToggleBtn: {
+    width: 26,
+    height: 26,
+    borderRadius: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+  },
+  pinToggleBtnActive: {
+    backgroundColor: '#DBEAFE',
+    borderColor: '#3B82F6',
+  },
+  pinToggleBtnInactive: {
+    backgroundColor: '#F3F4F6',
+    borderColor: '#D1D5DB',
+  },
+  pinToggleIcon: {
+    fontSize: 13,
+  },
+  pinToggleIconUnpinned: {
+    opacity: 0.45,
+  },
+  myCoursePillMinimal: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    minWidth: 155,
+    maxWidth: 230,
+  },
+  myCourseMinimalRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  myCourseTaskCountBadge: {
+    backgroundColor: '#F3F4F6',
+    borderWidth: 1,
+    borderColor: '#D1D5DB',
+    borderRadius: 10,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+  },
+  myCourseTaskCountText: {
+    fontSize: 10.5,
+    fontWeight: '700',
+    color: '#4B5563',
   },
   myCoursesTitle: {
     fontSize: 13,

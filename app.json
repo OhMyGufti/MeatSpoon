@@ -3,7 +3,7 @@
     "name": "MeatSpoon",
     "slug": "meatspoon-app",
     "scheme": "meatspoon",
-    "version": "1.0.1",
+    "version": "1.1.1",
     "orientation": "default",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
