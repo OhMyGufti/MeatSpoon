@@ -1,5 +1,7 @@
 // src/utils/colorPalette.ts
 
+export type PaletteMode = 'analog' | 'golden-angle' | 'polychromatic';
+
 export const DEFAULT_COLOR_PALETTE: string[] = [
   '#3B82F6', // Blue
   '#10B981', // Emerald
@@ -11,7 +13,65 @@ export const DEFAULT_COLOR_PALETTE: string[] = [
   '#6366F1', // Indigo
 ];
 
-export const HUE_STEP_OFFSETS: number[] = [-60, -45, -30, -15, 0, 15, 30, 45];
+export const PALETTE_MODE_OPTIONS: {
+  id: PaletteMode;
+  label: string;
+  formulaDesc: string;
+}[] = [
+  {
+    id: 'analog',
+    label: 'Analog',
+    formulaDesc: '±15° steps',
+  },
+  {
+    id: 'golden-angle',
+    label: 'Golden Angle',
+    formulaDesc: '137.5° steps',
+  },
+  {
+    id: 'polychromatic',
+    label: 'Balanced Polychromatic',
+    formulaDesc: '45° wheel',
+  },
+];
+
+const ANALOG_OFFSETS = [-60, -45, -30, -15, 0, 15, 30, 45];
+const GOLDEN_ANGLE_OFFSETS = Array.from({ length: 8 }, (_, i) => i * 137.5);
+const POLYCHROMATIC_OFFSETS = Array.from({ length: 8 }, (_, i) => i * 45);
+
+export function isValidPaletteMode(val: unknown): val is PaletteMode {
+  return (
+    val === 'analog' || val === 'golden-angle' || val === 'polychromatic'
+  );
+}
+
+export function getPaletteStepOffsets(mode: PaletteMode): number[] {
+  switch (mode) {
+    case 'golden-angle':
+      return GOLDEN_ANGLE_OFFSETS;
+    case 'polychromatic':
+      return POLYCHROMATIC_OFFSETS;
+    case 'analog':
+    default:
+      return ANALOG_OFFSETS;
+  }
+}
+
+export function getBaseColorSwatchIndex(mode: PaletteMode): number {
+  return mode === 'analog' ? 4 : 0;
+}
+
+export function getPaletteStepLabels(mode: PaletteMode): string[] {
+  const offsets = getPaletteStepOffsets(mode);
+  if (mode === 'analog') {
+    return offsets.map((deg) => (deg > 0 ? `+${deg}°` : `${deg}°`));
+  }
+  return offsets.map((deg, idx) => {
+    if (idx === 0) return 'Base';
+    const wrapped = Math.round((deg % 360) * 10) / 10;
+    return `+${wrapped}°`;
+  });
+}
 
 /**
  * Validates and normalizes a user-entered HEX color string into uppercase `#RRGGBB`.
@@ -32,10 +92,10 @@ export function normalizeHexColor(raw: string): string | null {
 }
 
 /**
- * 1. Converts a `#RRGGBB` HEX color to HSL `(h, s, l)` where:
- *    - `h` is in `[0, 360)`
- *    - `s` is in `[0, 1]`
- *    - `l` is in `[0, 1]`
+ * Converts a `#RRGGBB` HEX color to HSL `(h, s, l)` where:
+ * - `h` is in `[0, 360)`
+ * - `s` is in `[0, 1]`
+ * - `l` is in `[0, 1]`
  */
 export function hexToHsl(hex: string): { h: number; s: number; l: number } {
   const normalized = normalizeHexColor(hex) || '#3B82F6';
@@ -124,19 +184,23 @@ export function hslToHex(h: number, s: number, l: number): string {
 }
 
 /**
- * Generates an 8-color HEX palette from a single base HEX color:
- * 1. Converts base HEX to HSL `(H, S, L)`.
- * 2. Keeps `S` and `L` constant for all 8 colors.
- * 3. Shifts `H` in equal 15° steps: `[-60°, -45°, -30°, -15°, 0°, +15°, +30°, +45°]`,
- *    wrapping around `0-360` via `((h % 360) + 360) % 360`.
- * 4. Converts all 8 HSL values back to HEX strings.
+ * Generates an 8-color HEX palette from a base HEX color using the selected mode:
+ * - `'analog'`: `-60°, -45°, -30°, -15°, 0°, +15°, +30°, +45°`
+ * - `'golden-angle'`: `H_i = (H + i * 137.5) % 360` for `i = 0..7`
+ * - `'polychromatic'`: `H_i = (H + i * 45) % 360` for `i = 0..7`
+ * Keeps S and L constant for all 8 colors and wraps hue modulo `0-360`.
  */
-export function generateCustomPaletteFromHex(baseHex: string): string[] | null {
+export function generateCustomPaletteFromHex(
+  baseHex: string,
+  mode: PaletteMode = 'analog'
+): string[] | null {
   const normalized = normalizeHexColor(baseHex);
   if (!normalized) return null;
 
   const { h, s, l } = hexToHsl(normalized);
-  return HUE_STEP_OFFSETS.map((offset) => {
+  const offsets = getPaletteStepOffsets(mode);
+
+  return offsets.map((offset) => {
     const shiftedHue = (((h + offset) % 360) + 360) % 360;
     return hslToHex(shiftedHue, s, l);
   });

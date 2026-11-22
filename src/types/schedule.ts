@@ -1,4 +1,5 @@
 // src/types/schedule.ts
+import type { PaletteMode } from '../utils/colorPalette';
 
 export type DayOfWeek = 0 | 1 | 2 | 3 | 4; // 0 = Sunday, 4 = Thursday
 
@@ -87,6 +88,8 @@ export interface LocalBackupPayload {
   moodleIcalUrl?: string;
   floatingFreeTime?: boolean;
   myCoursesPinned?: boolean;
+  customPaletteEnabled?: boolean;
   customPaletteBaseHex?: string;
+  customPaletteMode?: PaletteMode;
   customPalette?: string[];
 }

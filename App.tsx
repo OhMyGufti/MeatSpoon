@@ -47,10 +47,17 @@ import {
 } from './src/services/cheesefork';
 import { mergeMoodleTasks } from './src/services/moodleSync';
 import MoodleSync from './src/components/MoodleSync';
+import BaseColorPicker from './src/components/BaseColorPicker';
 import { useMenuBackHandler } from './src/hooks/useMenuBackHandler';
+import { useCalendarWebPinchGuard } from './src/hooks/useCalendarWebPinchGuard';
 import {
   DEFAULT_COLOR_PALETTE,
+  PALETTE_MODE_OPTIONS,
+  PaletteMode,
   generateCustomPaletteFromHex,
+  getBaseColorSwatchIndex,
+  getPaletteStepLabels,
+  isValidPaletteMode,
   normalizeHexColor,
 } from './src/utils/colorPalette';
 import {
@@ -477,16 +484,20 @@ export default function App() {
   const [moodleIcalUrl, setMoodleIcalUrl] = useState<string>('');
   const [floatingFreeTime, setFloatingFreeTime] = useState<boolean>(false);
   const [myCoursesPinned, setMyCoursesPinned] = useState<boolean>(true);
+  const [customPaletteEnabled, setCustomPaletteEnabled] =
+    useState<boolean>(false);
+  const [customPaletteMode, setCustomPaletteMode] =
+    useState<PaletteMode>('analog');
   const [customPaletteBaseHex, setCustomPaletteBaseHex] = useState<string>('');
   const [customPaletteInput, setCustomPaletteInput] = useState<string>('#3B82F6');
   const [customPalette, setCustomPalette] = useState<string[] | null>(null);
 
   const activeColorPalette = useMemo(
     () =>
-      customPalette && customPalette.length === 8
+      customPaletteEnabled && customPalette && customPalette.length === 8
         ? customPalette
         : DEFAULT_COLOR_PALETTE,
-    [customPalette]
+    [customPaletteEnabled, customPalette]
   );
 
   const [toastBanner, setToastBanner] = useState<{
@@ -524,6 +535,23 @@ export default function App() {
   useMenuBackHandler(backupModalVisible, () => setBackupModalVisible(false));
   useMenuBackHandler(aboutModalVisible, () => setAboutModalVisible(false));
   useMenuBackHandler(webworkModalVisible, () => setWebworkModalVisible(false));
+
+  // Web/PWA Pinch-to-Zoom guard: prevents browser page zoom while keeping calendar pinch-scaling smooth
+  useCalendarWebPinchGuard({
+    enabled: !isHydratingStorage,
+    containerId: 'meatspoon-calendar-area',
+    scrollContainerId: 'meatspoon-calendar-scroll',
+    onTrackpadPinch: (deltaY) => {
+      setPixelsPerHour((prev) =>
+        Math.round(
+          Math.min(
+            MAX_PIXELS_PER_HOUR,
+            Math.max(MIN_PIXELS_PER_HOUR, prev - deltaY * 0.35)
+          )
+        )
+      );
+    },
+  });
 
   // "Free Time" Spontaneous Finder State
   const [spontaneousEvents, setSpontaneousEvents] = useState<SpontaneousEventItem[]>([]);
@@ -787,18 +815,44 @@ export default function App() {
           if (typeof parsed.myCoursesPinned === 'boolean') {
             setMyCoursesPinned(parsed.myCoursesPinned);
           }
-          if (
+          const loadedMode: PaletteMode = isValidPaletteMode(
+            parsed.customPaletteMode
+          )
+            ? parsed.customPaletteMode
+            : 'analog';
+          setCustomPaletteMode(loadedMode);
+
+          const loadedBaseHex =
+            typeof parsed.customPaletteBaseHex === 'string'
+              ? normalizeHexColor(parsed.customPaletteBaseHex) || ''
+              : '';
+          if (loadedBaseHex) {
+            setCustomPaletteBaseHex(loadedBaseHex);
+            setCustomPaletteInput(loadedBaseHex);
+          }
+
+          const loadedPaletteArr =
             Array.isArray(parsed.customPalette) &&
             parsed.customPalette.length === 8
-          ) {
-            setCustomPalette(parsed.customPalette);
-            setCustomColor(parsed.customPalette[4] || parsed.customPalette[0]);
+              ? parsed.customPalette
+              : loadedBaseHex
+              ? generateCustomPaletteFromHex(loadedBaseHex, loadedMode)
+              : null;
+          if (loadedPaletteArr) {
+            setCustomPalette(loadedPaletteArr);
           }
-          if (typeof parsed.customPaletteBaseHex === 'string') {
-            setCustomPaletteBaseHex(parsed.customPaletteBaseHex);
-            if (parsed.customPaletteBaseHex) {
-              setCustomPaletteInput(parsed.customPaletteBaseHex);
-            }
+
+          const loadedEnabled =
+            typeof parsed.customPaletteEnabled === 'boolean'
+              ? parsed.customPaletteEnabled
+              : Boolean(loadedPaletteArr);
+          setCustomPaletteEnabled(loadedEnabled);
+
+          if (loadedEnabled && loadedPaletteArr) {
+            setCustomColor(
+              loadedPaletteArr[getBaseColorSwatchIndex(loadedMode)] ||
+                loadedPaletteArr[0]
+            );
           }
         }
       } catch (err) {
@@ -816,28 +870,35 @@ export default function App() {
     };
   }, []);
 
+  const buildLocalBackupPayload = (
+    overrides?: Partial<LocalBackupPayload>
+  ): LocalBackupPayload => ({
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    events,
+    tasks,
+    desiredCourseIds,
+    lockedEvents,
+    hiddenKeys,
+    includedSpecialGroups,
+    autoOpenMoodleLogin,
+    moodleIcalUrl,
+    floatingFreeTime,
+    myCoursesPinned,
+    customPaletteEnabled,
+    customPaletteBaseHex,
+    customPaletteMode,
+    customPalette: customPalette || undefined,
+    ...overrides,
+  });
+
   // Save schedule data back to AsyncStorage whenever courses, custom events, tasks, or settings change
   useEffect(() => {
     if (isHydratingStorage) return;
 
     const persistSchedule = async () => {
       try {
-        const payload: LocalBackupPayload = {
-          version: 1,
-          exportedAt: new Date().toISOString(),
-          events,
-          tasks,
-          desiredCourseIds,
-          lockedEvents,
-          hiddenKeys,
-          includedSpecialGroups,
-          autoOpenMoodleLogin,
-          moodleIcalUrl,
-          floatingFreeTime,
-          myCoursesPinned,
-          customPaletteBaseHex,
-          customPalette: customPalette || undefined,
-        };
+        const payload = buildLocalBackupPayload();
         await AsyncStorage.setItem(ASYNC_STORAGE_KEY, JSON.stringify(payload));
       } catch (err) {
         console.warn('Failed to save schedule state to AsyncStorage:', err);
@@ -857,7 +918,9 @@ export default function App() {
     moodleIcalUrl,
     floatingFreeTime,
     myCoursesPinned,
+    customPaletteEnabled,
     customPaletteBaseHex,
+    customPaletteMode,
     customPalette,
   ]);
 
@@ -1555,22 +1618,7 @@ export default function App() {
 
     // Explicitly persist the newly extracted Webwork tasks to AsyncStorage before closing
     try {
-      const payload: LocalBackupPayload = {
-        version: 1,
-        exportedAt: new Date().toISOString(),
-        events,
-        tasks: updatedTasksSnapshot,
-        desiredCourseIds,
-        lockedEvents,
-        hiddenKeys,
-        includedSpecialGroups,
-        autoOpenMoodleLogin,
-        moodleIcalUrl,
-        floatingFreeTime,
-        myCoursesPinned,
-        customPaletteBaseHex,
-        customPalette: customPalette || undefined,
-      };
+      const payload = buildLocalBackupPayload({ tasks: updatedTasksSnapshot });
       await AsyncStorage.setItem(ASYNC_STORAGE_KEY, JSON.stringify(payload));
     } catch (err) {
       console.warn('Failed to persist Webwork tasks to AsyncStorage:', err);
@@ -1589,22 +1637,7 @@ export default function App() {
   const handleExportLocalState = async () => {
     try {
       setBackupBusy(true);
-      const payload: LocalBackupPayload = {
-        version: 1,
-        exportedAt: new Date().toISOString(),
-        events,
-        tasks,
-        desiredCourseIds,
-        lockedEvents,
-        hiddenKeys,
-        includedSpecialGroups,
-        autoOpenMoodleLogin,
-        moodleIcalUrl,
-        floatingFreeTime,
-        myCoursesPinned,
-        customPaletteBaseHex,
-        customPalette: customPalette || undefined,
-      };
+      const payload = buildLocalBackupPayload();
 
       const jsonText = JSON.stringify(payload, null, 2);
       await Clipboard.setStringAsync(jsonText);
@@ -1681,16 +1714,88 @@ export default function App() {
         typeof parsed.myCoursesPinned === 'boolean'
           ? parsed.myCoursesPinned
           : myCoursesPinned;
-      const nextCustomPaletteBaseHex =
-        typeof parsed.customPaletteBaseHex === 'string'
-          ? parsed.customPaletteBaseHex
-          : customPaletteBaseHex;
-      const nextCustomPalette =
-        Array.isArray(parsed.customPalette) && parsed.customPalette.length === 8
-          ? parsed.customPalette
-          : customPalette;
 
-      setEvents(incomingEvents);
+      // Backwards-compatible restoration of Color/Palette settings
+      const hasPaletteFields =
+        typeof parsed.customPaletteEnabled === 'boolean' ||
+        typeof parsed.customPaletteBaseHex === 'string' ||
+        isValidPaletteMode(parsed.customPaletteMode) ||
+        (Array.isArray(parsed.customPalette) &&
+          parsed.customPalette.length === 8);
+
+      let nextCustomPaletteMode = customPaletteMode;
+      let nextCustomPaletteBaseHex = customPaletteBaseHex;
+      let nextCustomPalette = customPalette;
+      let nextCustomPaletteEnabled = customPaletteEnabled;
+
+      if (hasPaletteFields) {
+        nextCustomPaletteMode = isValidPaletteMode(parsed.customPaletteMode)
+          ? parsed.customPaletteMode
+          : 'analog';
+
+        const parsedBase =
+          typeof parsed.customPaletteBaseHex === 'string'
+            ? normalizeHexColor(parsed.customPaletteBaseHex) || ''
+            : '';
+
+        const parsedExplicitPalette =
+          Array.isArray(parsed.customPalette) &&
+          parsed.customPalette.length === 8 &&
+          parsed.customPalette.every((c) => typeof c === 'string')
+            ? parsed.customPalette
+            : null;
+
+        nextCustomPaletteEnabled =
+          typeof parsed.customPaletteEnabled === 'boolean'
+            ? parsed.customPaletteEnabled
+            : Boolean(parsedExplicitPalette || parsedBase);
+
+        if (nextCustomPaletteEnabled) {
+          const baseForGeneration =
+            parsedBase ||
+            (parsedExplicitPalette &&
+              normalizeHexColor(
+                parsedExplicitPalette[
+                  getBaseColorSwatchIndex(nextCustomPaletteMode)
+                ]
+              )) ||
+            DEFAULT_COLOR_PALETTE[0];
+          nextCustomPaletteBaseHex = baseForGeneration;
+          nextCustomPalette =
+            parsedExplicitPalette ||
+            generateCustomPaletteFromHex(
+              baseForGeneration,
+              nextCustomPaletteMode
+            );
+        } else {
+          nextCustomPaletteBaseHex = parsedBase;
+          nextCustomPalette = parsedBase
+            ? parsedExplicitPalette ||
+              generateCustomPaletteFromHex(parsedBase, nextCustomPaletteMode)
+            : parsedExplicitPalette;
+        }
+      }
+
+      const appliedEvents = (() => {
+        if (!hasPaletteFields) return incomingEvents;
+        if (nextCustomPaletteEnabled && nextCustomPalette) {
+          const paletteSet = new Set(
+            nextCustomPalette.map((c) => c.toUpperCase())
+          );
+          const nonExamEvents = incomingEvents.filter((e) => e.type !== 'Exam');
+          const alreadyUsesPalette =
+            nonExamEvents.length === 0 ||
+            nonExamEvents.some((e) =>
+              paletteSet.has((e.color || '').toUpperCase())
+            );
+          return alreadyUsesPalette
+            ? incomingEvents
+            : remapEventsToPalette(incomingEvents, nextCustomPalette);
+        }
+        return incomingEvents;
+      })();
+
+      setEvents(appliedEvents);
       setTasks(incomingTasks);
       setDesiredCourseIds(incomingDesired);
       setLockedEvents(incomingLocked);
@@ -1700,16 +1805,23 @@ export default function App() {
       setMoodleIcalUrl(nextMoodleIcalUrl);
       setFloatingFreeTime(nextFloatingFreeTime);
       setMyCoursesPinned(nextMyCoursesPinned);
+      setCustomPaletteEnabled(nextCustomPaletteEnabled);
+      setCustomPaletteMode(nextCustomPaletteMode);
       setCustomPaletteBaseHex(nextCustomPaletteBaseHex);
-      if (nextCustomPaletteBaseHex) {
-        setCustomPaletteInput(nextCustomPaletteBaseHex);
-      }
+      setCustomPaletteInput(nextCustomPaletteBaseHex || '#3B82F6');
       setCustomPalette(nextCustomPalette);
 
-      const restoredPayload: LocalBackupPayload = {
-        version: 1,
-        exportedAt: new Date().toISOString(),
-        events: incomingEvents,
+      if (nextCustomPaletteEnabled && nextCustomPalette) {
+        setCustomColor(
+          nextCustomPalette[getBaseColorSwatchIndex(nextCustomPaletteMode)] ||
+            nextCustomPalette[0]
+        );
+      } else if (hasPaletteFields && !nextCustomPaletteEnabled) {
+        setCustomColor(DEFAULT_COLOR_PALETTE[3]);
+      }
+
+      const restoredPayload = buildLocalBackupPayload({
+        events: appliedEvents,
         tasks: incomingTasks,
         desiredCourseIds: incomingDesired,
         lockedEvents: incomingLocked,
@@ -1719,9 +1831,11 @@ export default function App() {
         moodleIcalUrl: nextMoodleIcalUrl,
         floatingFreeTime: nextFloatingFreeTime,
         myCoursesPinned: nextMyCoursesPinned,
+        customPaletteEnabled: nextCustomPaletteEnabled,
         customPaletteBaseHex: nextCustomPaletteBaseHex,
+        customPaletteMode: nextCustomPaletteMode,
         customPalette: nextCustomPalette || undefined,
-      };
+      });
       await AsyncStorage.setItem(
         ASYNC_STORAGE_KEY,
         JSON.stringify(restoredPayload)
@@ -1993,52 +2107,101 @@ export default function App() {
     }
   };
 
-  // Feature 6: Custom Palette Generator (HSL ±15° hue steps with constant S & L)
-  const applyPaletteToScheduleEvents = (nextPalette: string[]) => {
-    if (!nextPalette || nextPalette.length === 0) return;
-    setEvents((prev) => {
-      const keyColorMap = new Map<string, string>();
-      let colorCounter = 0;
-      return prev.map((ev) => {
-        if (ev.type === 'Exam') return ev;
-        const key = getEventRelationKey(ev);
-        if (!keyColorMap.has(key)) {
-          keyColorMap.set(
-            key,
-            nextPalette[colorCounter % nextPalette.length]
-          );
-          colorCounter += 1;
-        }
-        return {
-          ...ev,
-          color: keyColorMap.get(key)!,
-        };
-      });
+  // Feature 6: Custom Palette Generator (Analog / Golden Angle / Balanced Polychromatic)
+  const remapEventsToPalette = (
+    sourceEvents: ScheduleEvent[],
+    nextPalette: string[]
+  ): ScheduleEvent[] => {
+    if (!nextPalette || nextPalette.length === 0) return sourceEvents;
+    const keyColorMap = new Map<string, string>();
+    let colorCounter = 0;
+    return sourceEvents.map((ev) => {
+      if (ev.type === 'Exam') return ev;
+      const key = getEventRelationKey(ev);
+      if (!keyColorMap.has(key)) {
+        keyColorMap.set(key, nextPalette[colorCounter % nextPalette.length]);
+        colorCounter += 1;
+      }
+      return {
+        ...ev,
+        color: keyColorMap.get(key)!,
+      };
     });
-    setCustomColor(nextPalette[4] || nextPalette[0]);
   };
 
-  const handleApplyCustomPaletteBase = (rawHex: string) => {
+  const applyPaletteToScheduleEvents = (
+    nextPalette: string[],
+    modeForBase: PaletteMode = customPaletteMode
+  ) => {
+    if (!nextPalette || nextPalette.length === 0) return;
+    setEvents((prev) => remapEventsToPalette(prev, nextPalette));
+    setCustomColor(
+      nextPalette[getBaseColorSwatchIndex(modeForBase)] || nextPalette[0]
+    );
+  };
+
+  const handleApplyCustomPaletteBase = (
+    rawHex: string,
+    modeOverride?: PaletteMode,
+    showFeedback = true
+  ) => {
+    const modeToUse = modeOverride || customPaletteMode;
     setCustomPaletteInput(rawHex);
     const normalized = normalizeHexColor(rawHex);
     if (!normalized) {
-      showToastNotification(
-        'Please enter a valid HEX color (e.g. #3B82F6).',
-        'warning'
-      );
+      if (showFeedback) {
+        showToastNotification(
+          'Please enter a valid HEX color (e.g. #3B82F6).',
+          'warning'
+        );
+      }
       return;
     }
-    const generated = generateCustomPaletteFromHex(normalized);
+    const generated = generateCustomPaletteFromHex(normalized, modeToUse);
     if (!generated || generated.length !== 8) return;
 
+    setCustomPaletteEnabled(true);
+    setCustomPaletteMode(modeToUse);
     setCustomPaletteBaseHex(normalized);
     setCustomPaletteInput(normalized);
     setCustomPalette(generated);
-    applyPaletteToScheduleEvents(generated);
-    showToastNotification(
-      `Applied 8-color custom palette from ${normalized}`,
-      'success'
-    );
+    applyPaletteToScheduleEvents(generated, modeToUse);
+    if (showFeedback) {
+      showToastNotification(
+        `Applied ${PALETTE_MODE_OPTIONS.find((m) => m.id === modeToUse)?.label || 'custom'} palette from ${normalized}`,
+        'success'
+      );
+    }
+  };
+
+  const handleSelectPaletteMode = (nextMode: PaletteMode) => {
+    setCustomPaletteMode(nextMode);
+    const effectiveBase =
+      normalizeHexColor(customPaletteInput) ||
+      normalizeHexColor(customPaletteBaseHex) ||
+      DEFAULT_COLOR_PALETTE[0];
+    const generated = generateCustomPaletteFromHex(effectiveBase, nextMode);
+    if (!generated || generated.length !== 8) return;
+
+    setCustomPaletteEnabled(true);
+    setCustomPaletteBaseHex(effectiveBase);
+    setCustomPaletteInput(effectiveBase);
+    setCustomPalette(generated);
+    applyPaletteToScheduleEvents(generated, nextMode);
+  };
+
+  const handleToggleCustomPaletteEnabled = (enabled: boolean) => {
+    if (!enabled) {
+      setCustomPaletteEnabled(false);
+      applyPaletteToScheduleEvents(DEFAULT_COLOR_PALETTE, customPaletteMode);
+      showToastNotification('Switched to default 8-color palette', 'success');
+      return;
+    }
+    const effectiveBase =
+      normalizeHexColor(customPaletteInput) ||
+      normalizeHexColor(customPaletteBaseHex) ||
+      DEFAULT_COLOR_PALETTE[0];
+    handleApplyCustomPaletteBase(effectiveBase, customPaletteMode, true);
   };
 
   const handleCustomPaletteTextChange = (text: string) => {
@@ -2046,20 +2209,26 @@ export default function App() {
     const cleaned = text.trim().replace(/^#/, '');
     if (/^[0-9A-Fa-f]{6}$/.test(cleaned)) {
       const normalized = `#${cleaned.toUpperCase()}`;
-      const generated = generateCustomPaletteFromHex(normalized);
+      const generated = generateCustomPaletteFromHex(
+        normalized,
+        customPaletteMode
+      );
       if (generated && generated.length === 8) {
+        setCustomPaletteEnabled(true);
         setCustomPaletteBaseHex(normalized);
         setCustomPalette(generated);
-        applyPaletteToScheduleEvents(generated);
+        applyPaletteToScheduleEvents(generated, customPaletteMode);
       }
     }
   };
 
   const handleResetCustomPalette = () => {
+    setCustomPaletteEnabled(false);
     setCustomPaletteBaseHex('');
+    setCustomPaletteMode('analog');
     setCustomPalette(null);
     setCustomPaletteInput('#3B82F6');
-    applyPaletteToScheduleEvents(DEFAULT_COLOR_PALETTE);
+    applyPaletteToScheduleEvents(DEFAULT_COLOR_PALETTE, 'analog');
     showToastNotification('Reset to default 8-color palette', 'success');
   };
 
@@ -2599,41 +2768,97 @@ export default function App() {
                     />
                   </View>
 
-                  {/* Feature 6: "Custom Palette" Generator */}
+                  {/* Feature 6: "Custom Palette" Generator (3 Modes + Interactive Visual Color Picker) */}
                   <View style={styles.settingsPaletteContainer}>
                     <View style={styles.settingsPaletteHeaderRow}>
-                      <View>
+                      <View style={{ flex: 1, marginRight: 8 }}>
                         <Text style={styles.settingsOptionText}>
                           🎨 Custom Palette
                         </Text>
                         <Text style={styles.settingsPaletteSubText}>
-                          Base HEX → 8 HSL hues (-60° to +45° in 15° steps)
+                          {customPaletteEnabled
+                            ? `${PALETTE_MODE_OPTIONS.find((m) => m.id === customPaletteMode)?.label} (${PALETTE_MODE_OPTIONS.find((m) => m.id === customPaletteMode)?.formulaDesc})`
+                            : 'Using default 8-color palette'}
                         </Text>
                       </View>
-                      {customPalette && (
-                        <TouchableOpacity
-                          style={styles.settingsPaletteResetBtn}
-                          onPress={handleResetCustomPalette}
-                        >
-                          <Text style={styles.settingsPaletteResetText}>
-                            Reset
-                          </Text>
-                        </TouchableOpacity>
-                      )}
+                      <View style={styles.settingsPaletteHeaderRight}>
+                        {(customPaletteEnabled || Boolean(customPaletteBaseHex)) && (
+                          <TouchableOpacity
+                            style={styles.settingsPaletteResetBtn}
+                            onPress={handleResetCustomPalette}
+                          >
+                            <Text style={styles.settingsPaletteResetText}>
+                              Reset
+                            </Text>
+                          </TouchableOpacity>
+                        )}
+                        <Switch
+                          value={customPaletteEnabled}
+                          onValueChange={handleToggleCustomPaletteEnabled}
+                          trackColor={{ false: '#374151', true: '#2563EB' }}
+                          thumbColor={
+                            customPaletteEnabled ? '#FFFFFF' : '#9CA3AF'
+                          }
+                        />
+                      </View>
+                    </View>
+
+                    {/* 3 Palette Generation Mode Selector */}
+                    <View style={styles.settingsPaletteModeRow}>
+                      {PALETTE_MODE_OPTIONS.map((modeOpt) => {
+                        const isModeSelected =
+                          customPaletteMode === modeOpt.id;
+                        return (
+                          <TouchableOpacity
+                            key={modeOpt.id}
+                            activeOpacity={0.8}
+                            onPress={() => handleSelectPaletteMode(modeOpt.id)}
+                            style={[
+                              styles.settingsPaletteModeBtn,
+                              isModeSelected &&
+                                styles.settingsPaletteModeBtnActive,
+                            ]}
+                          >
+                            <Text
+                              style={[
+                                styles.settingsPaletteModeTitle,
+                                isModeSelected && { color: '#FFFFFF' },
+                              ]}
+                              numberOfLines={1}
+                            >
+                              {modeOpt.label}
+                            </Text>
+                            <Text
+                              style={[
+                                styles.settingsPaletteModeDesc,
+                                isModeSelected && { color: '#DBEAFE' },
+                              ]}
+                              numberOfLines={1}
+                            >
+                              {modeOpt.formulaDesc}
+                            </Text>
+                          </TouchableOpacity>
+                        );
+                      })}
                     </View>
 
                     <View style={styles.settingsPaletteInputRow}>
-                      <View
-                        style={[
-                          styles.settingsPaletteCurrentDot,
-                          {
-                            backgroundColor:
-                              normalizeHexColor(customPaletteInput) ||
-                              customPaletteBaseHex ||
-                              activeColorPalette[4] ||
-                              '#3B82F6',
-                          },
-                        ]}
+                      <BaseColorPicker
+                        color={
+                          normalizeHexColor(customPaletteInput) ||
+                          customPaletteBaseHex ||
+                          activeColorPalette[
+                            getBaseColorSwatchIndex(customPaletteMode)
+                          ] ||
+                          '#3B82F6'
+                        }
+                        onSelectColor={(pickedHex) =>
+                          handleApplyCustomPaletteBase(
+                            pickedHex,
+                            customPaletteMode,
+                            false
+                          )
+                        }
                       />
                       <TextInput
                         style={styles.settingsPaletteHexInput}
@@ -2648,7 +2873,11 @@ export default function App() {
                       <TouchableOpacity
                         style={styles.settingsPaletteApplyBtn}
                         onPress={() =>
-                          handleApplyCustomPaletteBase(customPaletteInput)
+                          handleApplyCustomPaletteBase(
+                            customPaletteInput,
+                            customPaletteMode,
+                            true
+                          )
                         }
                       >
                         <Text style={styles.settingsPaletteApplyBtnText}>
@@ -2656,17 +2885,27 @@ export default function App() {
                         </Text>
                       </TouchableOpacity>
                     </View>
+                    <Text style={styles.settingsPaletteTapHint}>
+                      Tap the color circle to open the color picker or enter a HEX code
+                    </Text>
 
                     {/* Quick Base Color Presets */}
                     <View style={styles.settingsPaletteQuickRow}>
                       {DEFAULT_COLOR_PALETTE.map((presetHex) => (
                         <TouchableOpacity
                           key={`preset-${presetHex}`}
-                          onPress={() => handleApplyCustomPaletteBase(presetHex)}
+                          onPress={() =>
+                            handleApplyCustomPaletteBase(
+                              presetHex,
+                              customPaletteMode,
+                              true
+                            )
+                          }
                           style={[
                             styles.settingsPaletteQuickDot,
                             { backgroundColor: presetHex },
-                            customPaletteBaseHex === presetHex &&
+                            customPaletteEnabled &&
+                              customPaletteBaseHex === presetHex &&
                               styles.settingsPaletteQuickDotSelected,
                           ]}
                         />
@@ -2678,11 +2917,12 @@ export default function App() {
                       Live 8-Color Palette Preview:
                     </Text>
                     <View style={styles.settingsPalettePreviewRow}>
-                      {activeColorPalette.map((hex, idx) => {
-                        const degOffset = -60 + idx * 15;
-                        const degLabel =
-                          degOffset > 0 ? `+${degOffset}°` : `${degOffset}°`;
-                        return (
+                      {(() => {
+                        const stepLabels =
+                          getPaletteStepLabels(customPaletteMode);
+                        const baseIdx =
+                          getBaseColorSwatchIndex(customPaletteMode);
+                        return activeColorPalette.map((hex, idx) => (
                           <View
                             key={`${hex}-${idx}`}
                             style={styles.settingsPalettePreviewItem}
@@ -2691,13 +2931,18 @@ export default function App() {
                               style={[
                                 styles.settingsPalettePreviewSwatch,
                                 { backgroundColor: hex },
-                                degOffset === 0 &&
-                                  Boolean(customPalette) &&
+                                idx === baseIdx &&
+                                  customPaletteEnabled &&
                                   styles.settingsPalettePreviewSwatchBase,
                               ]}
                             />
-                            <Text style={styles.settingsPalettePreviewDeg}>
-                              {degLabel}
+                            <Text
+                              style={styles.settingsPalettePreviewDeg}
+                              numberOfLines={1}
+                            >
+                              {customPaletteEnabled
+                                ? stepLabels[idx]
+                                : `#${idx + 1}`}
                             </Text>
                             <Text
                               style={styles.settingsPalettePreviewHex}
@@ -2706,8 +2951,8 @@ export default function App() {
                               {hex}
                             </Text>
                           </View>
-                        );
-                      })}
+                        ));
+                      })()}
                     </View>
                   </View>
                 </View>
@@ -2873,8 +3118,10 @@ export default function App() {
           >
             {/* MAIN CALENDAR AREA WITH SWIPE GESTURES, SLIDE ANIMATION & VERTICAL PINCH-TO-ZOOM */}
             <Animated.View
+              nativeID="meatspoon-calendar-area"
               style={[
                 styles.calendarMainArea,
+                Platform.OS === 'web' && ({ touchAction: 'none' } as any),
                 {
                   transform: [{ translateX: weekSlideAnim }],
                   opacity: weekOpacityAnim,
@@ -2964,6 +3211,7 @@ export default function App() {
 
             {/* WEEKLY SCHEDULE GRID WITH RTL COLUMNS, TAP-TO-CREATE & CURRENT TIME INDICATOR */}
             <ScrollView
+              nativeID="meatspoon-calendar-scroll"
               style={styles.gridScroll}
               scrollEnabled={!isPinching}
             >
@@ -4994,10 +5242,45 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 8,
   },
+  settingsPaletteHeaderRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
   settingsPaletteSubText: {
     color: '#9CA3AF',
     fontSize: 11,
     marginTop: 2,
+  },
+  settingsPaletteModeRow: {
+    flexDirection: 'row',
+    gap: 6,
+    marginBottom: 10,
+  },
+  settingsPaletteModeBtn: {
+    flex: 1,
+    backgroundColor: '#1F2937',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#374151',
+    paddingHorizontal: 6,
+    paddingVertical: 7,
+    alignItems: 'center',
+  },
+  settingsPaletteModeBtnActive: {
+    backgroundColor: '#1D4ED8',
+    borderColor: '#60A5FA',
+  },
+  settingsPaletteModeTitle: {
+    color: '#E5E7EB',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  settingsPaletteModeDesc: {
+    color: '#9CA3AF',
+    fontSize: 9.5,
+    fontWeight: '600',
+    marginTop: 1,
   },
   settingsPaletteResetBtn: {
     backgroundColor: '#374151',
@@ -5014,14 +5297,12 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
-    marginBottom: 10,
+    marginBottom: 6,
   },
-  settingsPaletteCurrentDot: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    borderWidth: 2,
-    borderColor: '#F9FAFB',
+  settingsPaletteTapHint: {
+    color: '#6B7280',
+    fontSize: 10,
+    marginBottom: 8,
   },
   settingsPaletteHexInput: {
     flex: 1,
