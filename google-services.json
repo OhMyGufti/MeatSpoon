@@ -14,11 +14,11 @@
       },
       "oauth_client": [
         {
-          "client_id": "35614474326-efp32sdcp6l6tl6co8jqott72fia0sbn.apps.googleusercontent.com",
+          "client_id": "35614474326-hdb7rom2tc1q433n6v09hgc1tci8ni7a.apps.googleusercontent.com",
           "client_type": 1,
           "android_info": {
             "package_name": "com.meatspoon.app",
-            "certificate_hash": "d899c3b1a6357a12b6190722c15c3488eb81fa20"
+            "certificate_hash": "561e70eeb547ab07d7e05e8a75d4cf1e210b6b42"
           }
         },
         {

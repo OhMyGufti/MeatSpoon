@@ -60,6 +60,7 @@ import {
   isValidPaletteMode,
   normalizeHexColor,
 } from './src/utils/colorPalette';
+import { getBuildingMapsUrl } from './src/utils/technionBuildings';
 import {
   WEBWORK_LOGIN_URL,
   WEBWORK_INJECTED_SYNC_SCRIPT,
@@ -4233,10 +4234,67 @@ export default function App() {
                   </Text>
                 )}
                 {selectedEvent.location && (
-                  <Text style={styles.inspectorMeta}>
-                    {selectedEvent.type === 'Exam' ? 'Date:' : 'Location:'}{' '}
-                    {selectedEvent.location}
-                  </Text>
+                  <View style={styles.inspectorLocationRow}>
+                    <Text style={[styles.inspectorMeta, styles.inspectorLocationText]}>
+                      {selectedEvent.type === 'Exam' ? 'Date:' : 'Location:'}{' '}
+                      {selectedEvent.location}
+                    </Text>
+                    {selectedEvent.type !== 'Exam' &&
+                      (() => {
+                        const mapsUrl = getBuildingMapsUrl(
+                          selectedEvent.location
+                        );
+                        if (!mapsUrl) return null;
+                        return (
+                          <TouchableOpacity
+                            activeOpacity={0.8}
+                            style={[
+                              styles.navigateBuildingBtn,
+                              {
+                                borderColor:
+                                  selectedEvent.color ||
+                                  activeColorPalette[0] ||
+                                  '#2563EB',
+                              },
+                            ]}
+                            onPress={() => {
+                              if (
+                                Platform.OS === 'web' &&
+                                typeof window !== 'undefined' &&
+                                typeof window.open === 'function'
+                              ) {
+                                window.open(
+                                  mapsUrl,
+                                  '_blank',
+                                  'noopener,noreferrer'
+                                );
+                              } else {
+                                Linking.openURL(mapsUrl).catch(() =>
+                                  Alert.alert(
+                                    'Cannot Open Maps',
+                                    'Unable to open Google Maps for this location.'
+                                  )
+                                );
+                              }
+                            }}
+                          >
+                            <Text
+                              style={[
+                                styles.navigateBuildingBtnText,
+                                {
+                                  color:
+                                    selectedEvent.color ||
+                                    activeColorPalette[0] ||
+                                    '#2563EB',
+                                },
+                              ]}
+                            >
+                              📍 Navigate
+                            </Text>
+                          </TouchableOpacity>
+                        );
+                      })()}
+                  </View>
                 )}
 
                 {selectedEvent.type !== 'Exam' && (
@@ -6686,6 +6744,34 @@ const styles = StyleSheet.create({
   },
   inspectorTitle: { fontSize: 18, fontWeight: 'bold', marginBottom: 4 },
   inspectorMeta: { fontSize: 13, color: '#4B5563', marginBottom: 2 },
+  inspectorLocationRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 2,
+    marginBottom: 4,
+  },
+  inspectorLocationText: {
+    flexShrink: 1,
+    marginBottom: 0,
+  },
+  navigateBuildingBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F3F4F6',
+    borderWidth: 1.5,
+    borderColor: '#2563EB',
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  navigateBuildingBtnText: {
+    fontSize: 11.5,
+    fontWeight: '700',
+    color: '#2563EB',
+  },
   aboutBodyText: {
     fontSize: 13.5,
     lineHeight: 20,
