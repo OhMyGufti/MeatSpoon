@@ -1,8 +1,8 @@
 {
   "name": "meatspoon-app",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "homepage": "https://OhMyGufti.github.io/MeatSpoon",
-  "main": "node_modules/expo/AppEntry.js",
+  "main": "index.ts",
   "scripts": {
     "start": "expo start",
     "android": "expo start --android",

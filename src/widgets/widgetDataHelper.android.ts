@@ -22,10 +22,18 @@ export type WidgetTimelineListItem =
       event: ScheduleEvent;
       color: `#${string}`;
       timeRangeLabel: string;
+      /**
+       * Defined (0..1) when `now` is currently inside `[event.startHour, event.endHour]`.
+       * Used by `DailyScheduleWidget` to overlay the gray timeline bar across the card via `OverlapWidget`.
+       */
+      ongoingProgress?: number;
+      /**
+       * Hourly markers (e.g. ["08:00", "09:00"]) for the optional left time-axis column.
+       */
+      axisHourLabels: string[];
     }
   | {
       kind: 'now';
-      currentTimeLabel: string;
     };
 
 export interface AndroidWidgetSnapshot {
@@ -34,6 +42,7 @@ export interface AndroidWidgetSnapshot {
   timelineItems: WidgetTimelineListItem[];
   freeTimeDuration: number;
   hasFreeTimeInWindow: boolean;
+  widgetShowTimeAxis: boolean;
 }
 
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -54,6 +63,19 @@ export function formatWidgetHour(decHour: number): string {
     m = 0;
   }
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
+function buildEventAxisHourLabels(startHour: number, endHour: number): string[] {
+  const firstH = Math.max(0, Math.min(23, Math.floor(startHour)));
+  const lastH = Math.max(firstH, Math.min(23, Math.floor(Math.max(startHour, endHour - 0.01))));
+  const labels: string[] = [];
+  for (let h = firstH; h <= lastH; h++) {
+    labels.push(`${String(h).padStart(2, '0')}:00`);
+  }
+  if (labels.length === 0) {
+    labels.push(`${String(firstH).padStart(2, '0')}:00`);
+  }
+  return labels.slice(0, 5);
 }
 
 function getEventRelationKey(ev: ScheduleEvent): string {
@@ -110,7 +132,6 @@ export function checkFreeTimeInLookaheadWindow(
       merged.push({ ...iv });
     } else {
       const last = merged[merged.length - 1];
-      // Merge overlapping or back-to-back classes (tolerance ~1 minute)
       if (iv.start <= last.end + 0.02) {
         last.end = Math.max(last.end, iv.end);
       } else {
@@ -124,7 +145,6 @@ export function checkFreeTimeInLookaheadWindow(
     busyHours += Math.max(0, m.end - m.start);
   }
 
-  // If busy time covers the entire lookahead window, there is NO free time
   return busyHours < safeDuration - 0.02;
 }
 
@@ -158,6 +178,7 @@ export async function loadAndroidWidgetSnapshot(
   const rawDuration =
     typeof parsed.freeTimeDuration === 'number' ? parsed.freeTimeDuration : 2;
   const freeTimeDuration = Math.max(1, Math.min(8, Math.round(rawDuration)));
+  const widgetShowTimeAxis = Boolean(parsed.widgetShowTimeAxis);
 
   const palette =
     parsed.customPaletteEnabled &&
@@ -217,23 +238,28 @@ export async function loadAndroidWidgetSnapshot(
     .sort((a, b) => a.startHour - b.startHour || a.endHour - b.endHour);
 
   const currentDecHour = now.getHours() + now.getMinutes() / 60;
-  const currentTimeLabel = `${String(now.getHours()).padStart(
-    2,
-    '0'
-  )}:${String(now.getMinutes()).padStart(2, '0')}`;
 
-  // 3. Build chronological list with Current-Time Gray Timeline Indicator inserted at the exact position
+  // 3. Check if `now` falls inside any ongoing event(s)
+  const hasOngoingEvent = todayEvents.some(
+    (ev) => currentDecHour >= ev.startHour && currentDecHour <= ev.endHour
+  );
+
   const timelineItems: WidgetTimelineListItem[] = [];
-  let insertedNowLine = false;
+  let insertedStandaloneNowLine = hasOngoingEvent;
 
   for (const ev of todayEvents) {
-    if (!insertedNowLine && currentDecHour < ev.startHour) {
-      timelineItems.push({
-        kind: 'now',
-        currentTimeLabel,
-      });
-      insertedNowLine = true;
+    // If not inside any ongoing event, insert the standalone gray timeline row before the first future event
+    if (!insertedStandaloneNowLine && currentDecHour < ev.startHour) {
+      timelineItems.push({ kind: 'now' });
+      insertedStandaloneNowLine = true;
     }
+
+    const isOngoing =
+      currentDecHour >= ev.startHour && currentDecHour <= ev.endHour;
+    const duration = Math.max(0.1, ev.endHour - ev.startHour);
+    const ongoingProgress = isOngoing
+      ? Math.max(0, Math.min(1, (currentDecHour - ev.startHour) / duration))
+      : undefined;
 
     timelineItems.push({
       kind: 'event',
@@ -242,14 +268,13 @@ export async function loadAndroidWidgetSnapshot(
       timeRangeLabel: `${formatWidgetHour(ev.startHour)} – ${formatWidgetHour(
         ev.endHour
       )}`,
+      ongoingProgress,
+      axisHourLabels: buildEventAxisHourLabels(ev.startHour, ev.endHour),
     });
   }
 
-  if (!insertedNowLine) {
-    timelineItems.push({
-      kind: 'now',
-      currentTimeLabel,
-    });
+  if (!insertedStandaloneNowLine) {
+    timelineItems.push({ kind: 'now' });
   }
 
   // 4. Determine if there is any free time within the next `freeTimeDuration` hours
@@ -265,5 +290,6 @@ export async function loadAndroidWidgetSnapshot(
     timelineItems,
     freeTimeDuration,
     hasFreeTimeInWindow,
+    widgetShowTimeAxis,
   };
 }

@@ -516,6 +516,7 @@ export default function App() {
   const [freeTimeDuration, setFreeTimeDuration] = useState<number>(2);
   const [freeTimeDurationDropdownOpen, setFreeTimeDurationDropdownOpen] =
     useState<boolean>(false);
+  const [widgetShowTimeAxis, setWidgetShowTimeAxis] = useState<boolean>(false);
   const [myCoursesPinned, setMyCoursesPinned] = useState<boolean>(true);
   const [dismissedTaskIds, setDismissedTaskIds] = useState<string[]>([]);
   const [myTasksModalVisible, setMyTasksModalVisible] = useState<boolean>(false);
@@ -1148,6 +1149,9 @@ export default function App() {
           ) {
             setFreeTimeDuration(Math.round(parsed.freeTimeDuration));
           }
+          if (typeof parsed.widgetShowTimeAxis === 'boolean') {
+            setWidgetShowTimeAxis(parsed.widgetShowTimeAxis);
+          }
           if (typeof parsed.myCoursesPinned === 'boolean') {
             setMyCoursesPinned(parsed.myCoursesPinned);
           }
@@ -1234,6 +1238,7 @@ export default function App() {
     floatingFreeTime,
     floatingMyTasks,
     freeTimeDuration,
+    widgetShowTimeAxis,
     myCoursesPinned,
     customPaletteEnabled,
     customPaletteBaseHex,
@@ -1273,6 +1278,7 @@ export default function App() {
     floatingFreeTime,
     floatingMyTasks,
     freeTimeDuration,
+    widgetShowTimeAxis,
     myCoursesPinned,
     customPaletteEnabled,
     customPaletteBaseHex,
@@ -2184,6 +2190,10 @@ export default function App() {
       parsed.freeTimeDuration <= 8
         ? Math.round(parsed.freeTimeDuration)
         : freeTimeDuration;
+    const nextWidgetShowTimeAxis =
+      typeof parsed.widgetShowTimeAxis === 'boolean'
+        ? parsed.widgetShowTimeAxis
+        : widgetShowTimeAxis;
     const nextMyCoursesPinned =
       typeof parsed.myCoursesPinned === 'boolean'
         ? parsed.myCoursesPinned
@@ -2292,6 +2302,7 @@ export default function App() {
     setFloatingFreeTime(nextFloatingFreeTime);
     setFloatingMyTasks(nextFloatingMyTasks);
     setFreeTimeDuration(nextFreeTimeDuration);
+    setWidgetShowTimeAxis(nextWidgetShowTimeAxis);
     setMyCoursesPinned(nextMyCoursesPinned);
     setCustomPaletteEnabled(nextCustomPaletteEnabled);
     setCustomPaletteMode(nextCustomPaletteMode);
@@ -2321,6 +2332,7 @@ export default function App() {
       floatingFreeTime: nextFloatingFreeTime,
       floatingMyTasks: nextFloatingMyTasks,
       freeTimeDuration: nextFreeTimeDuration,
+      widgetShowTimeAxis: nextWidgetShowTimeAxis,
       myCoursesPinned: nextMyCoursesPinned,
       customPaletteEnabled: nextCustomPaletteEnabled,
       customPaletteBaseHex: nextCustomPaletteBaseHex,
@@ -2449,6 +2461,7 @@ export default function App() {
     floatingFreeTime,
     floatingMyTasks,
     freeTimeDuration,
+    widgetShowTimeAxis,
     myCoursesPinned,
     customPaletteEnabled,
     customPaletteBaseHex,
@@ -3636,6 +3649,26 @@ export default function App() {
                       thumbColor={floatingMyTasks ? '#FFFFFF' : '#9CA3AF'}
                     />
                   </View>
+
+                  {/* Android-Only Setting: "Show Times on Widget" (Side Time Axis on DailyScheduleWidget) */}
+                  {Platform.OS === 'android' && (
+                    <View style={styles.settingsOptionRow}>
+                      <Text
+                        style={[
+                          styles.settingsOptionText,
+                          styles.settingsToggleLabelText,
+                        ]}
+                      >
+                        Show Times on Widget
+                      </Text>
+                      <Switch
+                        value={widgetShowTimeAxis}
+                        onValueChange={setWidgetShowTimeAxis}
+                        trackColor={{ false: '#374151', true: '#2563EB' }}
+                        thumbColor={widgetShowTimeAxis ? '#FFFFFF' : '#9CA3AF'}
+                      />
+                    </View>
+                  )}
 
                   {/* Feature: "Free Time Duration" Dropdown/Picker (1h - 8h, default 2h) */}
                   <View style={styles.settingsDurationContainer}>

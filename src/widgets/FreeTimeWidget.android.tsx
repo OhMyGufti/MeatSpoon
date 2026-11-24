@@ -1,3 +1,4 @@
+'use no memo';
 // src/widgets/FreeTimeWidget.android.tsx
 import React from 'react';
 import { FlexWidget, SvgWidget } from 'react-native-android-widget';
@@ -22,7 +23,7 @@ function buildFreeTimeClockSvg(hasFreeTime: boolean): string {
   const bezelStroke = hasFreeTime ? '#60A5FA' : '#6B7280';
   const handColor = hasFreeTime ? '#1D4ED8' : '#4B5563';
   const tickColor = hasFreeTime ? '#93C5FD' : '#6B7280';
-  const overallOpacity = hasFreeTime ? '1.0' : '0.45';
+  const overallOpacity = hasFreeTime ? '1.0' : '0.5';
 
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
     <g opacity="${overallOpacity}">
@@ -52,6 +53,8 @@ export function FreeTimeWidget({ hasFreeTime }: FreeTimeWidgetProps) {
         width: 'match_parent',
         alignItems: 'center',
         justifyContent: 'center',
+        backgroundColor: hasFreeTime ? '#1F2937' : '#262A30',
+        borderRadius: 28,
         padding: 2,
       }}
     >
@@ -60,8 +63,8 @@ export function FreeTimeWidget({ hasFreeTime }: FreeTimeWidgetProps) {
         clickAction="OPEN_URI"
         clickActionData={{ uri: 'meatspoon://free-time' }}
         style={{
-          width: 52,
-          height: 52,
+          width: 48,
+          height: 48,
         }}
       />
     </FlexWidget>

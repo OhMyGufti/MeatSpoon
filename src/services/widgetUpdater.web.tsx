@@ -1,4 +1,4 @@
-// src/services/widgetUpdater.web.ts
+// src/services/widgetUpdater.web.tsx
 export function initAndroidWidgetTaskHandler(): void {
   // No-op on Web (PWA)
 }
