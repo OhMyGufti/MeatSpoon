@@ -520,10 +520,17 @@ export function parseMoodleSyncPayload(
   }
 
   // Map candidates to CourseTask items linked to existing courses (or a Moodle course group)
+  const usedIds = new Set<string>();
   return candidates.map((cand, idx) => {
     const matched = matchCourseForMoodleTask(cand.courseHint, events, catalog);
+    const cleanUid = String(cand.uid || `${cand.title}-${cand.deadlineDate.getTime()}`).trim();
+    let stableId = `moodle-task-${cleanUid}`;
+    if (usedIds.has(stableId)) {
+      stableId = `${stableId}-${idx}`;
+    }
+    usedIds.add(stableId);
     return {
-      id: `moodle-task-${cand.uid}-${idx}`,
+      id: stableId,
       relationKey: matched.relationKey,
       courseId: matched.courseId,
       courseTitle: matched.courseTitle,
@@ -760,22 +767,172 @@ export function buildMoodleTaskSignature(task: CourseTask): string {
 }
 
 /**
- * Deduplicates incoming tasks against existing tasks by normalized title + minute
- * timestamp and sorts ascending by `deadlineISO`.
+ * Normalizes a Moodle task ID so both legacy (`moodle-task-<uid>-<idx>`) and
+ * current (`moodle-task-<uid>`) task IDs resolve to the same stable iCal UID key.
+ */
+export function normalizeMoodleTaskId(rawId: string): string {
+  const trimmed = (rawId || '').trim();
+  if (!trimmed) return '';
+  // Legacy format had `moodle-task-<uid>@<domain>-<idx>`
+  const legacyIcalMatch = trimmed.match(/^(moodle-task-[^@]+@[^\s-]+)-\d+$/);
+  if (legacyIcalMatch) {
+    return legacyIcalMatch[1];
+  }
+  // Legacy ajax format had `moodle-task-ajax-<timeSec>-<idx>` or `moodle-task-<digits>-<idx>`
+  const legacyAjaxMatch = trimmed.match(/^(moodle-task-(?:ajax-\d+|\d+))-\d+$/);
+  if (legacyAjaxMatch) {
+    return legacyAjaxMatch[1];
+  }
+  return trimmed;
+}
+
+/**
+ * Checks whether a task is marked as completed/done according to `dismissedTaskIds`.
+ */
+export function isTaskDismissed(
+  task: CourseTask,
+  dismissedTaskIds: string[] = []
+): boolean {
+  if (!dismissedTaskIds || dismissedTaskIds.length === 0) return false;
+  const normId = normalizeMoodleTaskId(task.id);
+  const sig = buildMoodleTaskSignature(task);
+  for (const raw of dismissedTaskIds) {
+    const normDismissed = normalizeMoodleTaskId(raw);
+    if (
+      raw === task.id ||
+      normDismissed === normId ||
+      raw === sig ||
+      normDismissed === sig
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Reconciles incoming Moodle tasks with existing tasks and `dismissedTaskIds`:
+ * - Keeps completed tasks (whose IDs are in `dismissedTaskIds`) inside the tasks list
+ *   so they can be displayed as DONE and toggled back to UNDONE in the "My Tasks" modal.
+ * - Garbage collection (runs only on a valid non-empty Moodle sync): any Moodle task
+ *   that is NO LONGER present in the incoming feed is removed from both `mergedTasks`
+ *   AND `dismissedTaskIds`.
+ */
+export function reconcileMoodleTasksWithDismissed(
+  existingTasks: CourseTask[],
+  incomingMoodleTasks: CourseTask[],
+  currentDismissedIds: string[] = []
+): {
+  mergedTasks: CourseTask[];
+  newlyAddedCount: number;
+  updatedDismissedIds: string[];
+} {
+  const normalizedCurrentDismissed = Array.from(
+    new Set(
+      (currentDismissedIds || [])
+        .map((id) => normalizeMoodleTaskId(id))
+        .filter(Boolean)
+    )
+  );
+
+  // If the incoming Moodle feed is empty/failed, do not run garbage collection
+  if (incomingMoodleTasks.length === 0) {
+    return {
+      mergedTasks: existingTasks,
+      newlyAddedCount: 0,
+      updatedDismissedIds: normalizedCurrentDismissed,
+    };
+  }
+
+  // Build set of all stable IDs & signatures present in the newly synced Moodle feed
+  const incomingFeedKeys = new Set<string>();
+  for (const t of incomingMoodleTasks) {
+    incomingFeedKeys.add(normalizeMoodleTaskId(t.id));
+    incomingFeedKeys.add(t.id);
+    incomingFeedKeys.add(buildMoodleTaskSignature(t));
+  }
+
+  // Garbage collection on existingTasks:
+  // Remove any Moodle task that is NO LONGER present in the incoming Moodle feed,
+  // while preserving non-Moodle tasks (Manual / Webwork).
+  const retainedExistingTasks = existingTasks.filter((t) => {
+    const isMoodleTask =
+      t.source === 'Moodle' || t.id.startsWith('moodle-task-');
+    if (!isMoodleTask) return true;
+    return (
+      incomingFeedKeys.has(normalizeMoodleTaskId(t.id)) ||
+      incomingFeedKeys.has(t.id) ||
+      incomingFeedKeys.has(buildMoodleTaskSignature(t))
+    );
+  });
+
+  // Also track keys of retained non-Moodle tasks so their DONE state is preserved
+  const nonMoodleKeys = new Set<string>();
+  for (const t of retainedExistingTasks) {
+    const isMoodleTask =
+      t.source === 'Moodle' || t.id.startsWith('moodle-task-');
+    if (!isMoodleTask) {
+      nonMoodleKeys.add(normalizeMoodleTaskId(t.id));
+      nonMoodleKeys.add(t.id);
+      nonMoodleKeys.add(buildMoodleTaskSignature(t));
+    }
+  }
+
+  // Garbage collection on dismissedTaskIds:
+  // Keep only IDs that are still present in the incoming Moodle feed (or belong to an existing non-Moodle task)
+  const updatedDismissedIds = normalizedCurrentDismissed.filter((id) => {
+    const norm = normalizeMoodleTaskId(id);
+    return (
+      incomingFeedKeys.has(id) ||
+      incomingFeedKeys.has(norm) ||
+      nonMoodleKeys.has(id) ||
+      nonMoodleKeys.has(norm)
+    );
+  });
+
+  // Merge all incoming Moodle tasks (including completed ones so they stay available for display & UNDONE)
+  const { mergedTasks, newlyAddedCount } = mergeMoodleTasks(
+    retainedExistingTasks,
+    incomingMoodleTasks
+  );
+
+  return {
+    mergedTasks,
+    newlyAddedCount,
+    updatedDismissedIds,
+  };
+}
+
+/**
+ * Deduplicates incoming tasks against existing tasks by normalized ID or normalized title + minute
+ * timestamp and sorts ascending by `deadlineISO`. Keeps completed tasks in the list.
  */
 export function mergeMoodleTasks(
   existingTasks: CourseTask[],
   incomingTasks: CourseTask[]
 ): { mergedTasks: CourseTask[]; newlyAddedCount: number } {
-  const existingSignatures = new Set(existingTasks.map(buildMoodleTaskSignature));
-  const merged = [...existingTasks];
+  const existingSignatures = new Set(
+    existingTasks.map(buildMoodleTaskSignature)
+  );
+  const existingNormalizedIds = new Set(
+    existingTasks.map((t) => normalizeMoodleTaskId(t.id))
+  );
+  const merged = existingTasks.map((t) => ({
+    ...t,
+    id: normalizeMoodleTaskId(t.id) || t.id,
+  }));
   let newlyAddedCount = 0;
 
   for (const incoming of incomingTasks) {
+    const normId = normalizeMoodleTaskId(incoming.id);
     const sig = buildMoodleTaskSignature(incoming);
-    if (!existingSignatures.has(sig)) {
+    if (!existingSignatures.has(sig) && !existingNormalizedIds.has(normId)) {
       existingSignatures.add(sig);
-      merged.push(incoming);
+      existingNormalizedIds.add(normId);
+      merged.push({
+        ...incoming,
+        id: normId || incoming.id,
+      });
       newlyAddedCount += 1;
     }
   }
@@ -792,13 +949,18 @@ export type PersistedStateSnapshot = Omit<
 /**
  * Merges synced Moodle tasks into the canonical AsyncStorage payload
  * (`@meatspoon_persisted_state_v1`) using the exact `LocalBackupPayload` schema
- * shared across Web and Native platforms.
+ * shared across Web and Native platforms, enforcing `dismissedTaskIds` filtering
+ * and garbage collection.
  */
 export async function persistMoodleTasksToStorage(
   incomingTasks: CourseTask[],
   stateSnapshot: PersistedStateSnapshot,
   isHydratingStorage = false
-): Promise<{ mergedTasks: CourseTask[]; newlyAddedCount: number }> {
+): Promise<{
+  mergedTasks: CourseTask[];
+  newlyAddedCount: number;
+  updatedDismissedIds: string[];
+}> {
   let existingPayload: Partial<LocalBackupPayload> = {};
   try {
     const rawSaved = await AsyncStorage.getItem(ASYNC_STORAGE_KEY);
@@ -817,10 +979,20 @@ export async function persistMoodleTasksToStorage(
       ? existingPayload.tasks
       : stateSnapshot.tasks;
 
-  const { mergedTasks, newlyAddedCount } = mergeMoodleTasks(
-    baseTasks,
-    incomingTasks
-  );
+  const baseDismissedIds =
+    isHydratingStorage && Array.isArray(existingPayload.dismissedTaskIds)
+      ? existingPayload.dismissedTaskIds
+      : stateSnapshot.dismissedTaskIds ||
+        (Array.isArray(existingPayload.dismissedTaskIds)
+          ? existingPayload.dismissedTaskIds
+          : []);
+
+  const { mergedTasks, newlyAddedCount, updatedDismissedIds } =
+    reconcileMoodleTasksWithDismissed(
+      baseTasks,
+      incomingTasks,
+      baseDismissedIds
+    );
 
   const nextPayload: LocalBackupPayload = {
     ...existingPayload,
@@ -831,6 +1003,7 @@ export async function persistMoodleTasksToStorage(
         ? existingPayload.events
         : stateSnapshot.events,
     tasks: mergedTasks,
+    dismissedTaskIds: updatedDismissedIds,
     desiredCourseIds:
       isHydratingStorage && Array.isArray(existingPayload.desiredCourseIds)
         ? existingPayload.desiredCourseIds
@@ -867,5 +1040,5 @@ export async function persistMoodleTasksToStorage(
     console.warn('Failed to save synced Moodle tasks to AsyncStorage:', err);
   }
 
-  return { mergedTasks, newlyAddedCount };
+  return { mergedTasks, newlyAddedCount, updatedDismissedIds };
 }

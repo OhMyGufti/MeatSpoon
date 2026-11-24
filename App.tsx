@@ -45,9 +45,18 @@ import {
   syncCheeseforkCatalogWithCache,
   CHEESEFORK_JS_URL,
 } from './src/services/cheesefork';
-import { mergeMoodleTasks } from './src/services/moodleSync';
+import {
+  isTaskDismissed,
+  mergeMoodleTasks,
+  normalizeMoodleTaskId,
+  reconcileMoodleTasksWithDismissed,
+} from './src/services/moodleSync';
 import MoodleSync from './src/components/MoodleSync';
 import BaseColorPicker from './src/components/BaseColorPicker';
+import ClockTimePickerModal, {
+  formatDecimalHourToHHMM,
+  timeValueToDecimalHour,
+} from './src/components/ClockTimePickerModal';
 import { useMenuBackHandler } from './src/hooks/useMenuBackHandler';
 import { useCalendarWebPinchGuard } from './src/hooks/useCalendarWebPinchGuard';
 import {
@@ -495,7 +504,14 @@ export default function App() {
   const [autoOpenMoodleLogin, setAutoOpenMoodleLogin] = useState<boolean>(true);
   const [moodleIcalUrl, setMoodleIcalUrl] = useState<string>('');
   const [floatingFreeTime, setFloatingFreeTime] = useState<boolean>(false);
+  const [floatingMyTasks, setFloatingMyTasks] = useState<boolean>(false);
   const [myCoursesPinned, setMyCoursesPinned] = useState<boolean>(true);
+  const [dismissedTaskIds, setDismissedTaskIds] = useState<string[]>([]);
+  const [myTasksModalVisible, setMyTasksModalVisible] = useState<boolean>(false);
+  const [showDoneTasks, setShowDoneTasks] = useState<boolean>(true);
+  const [clockPickerTarget, setClockPickerTarget] = useState<
+    'start' | 'end' | null
+  >(null);
   const [customPaletteEnabled, setCustomPaletteEnabled] =
     useState<boolean>(false);
   const [customPaletteMode, setCustomPaletteMode] =
@@ -558,6 +574,12 @@ export default function App() {
   useMenuBackHandler(freeTimeModalVisible, () =>
     setFreeTimeModalVisible(false)
   );
+  useMenuBackHandler(myTasksModalVisible, () =>
+    setMyTasksModalVisible(false)
+  );
+  useMenuBackHandler(clockPickerTarget !== null, () =>
+    setClockPickerTarget(null)
+  );
   useMenuBackHandler(taskModalVisible, () => setTaskModalVisible(false));
   useMenuBackHandler(!!selectedTask, () => setSelectedTask(null));
   useMenuBackHandler(backupModalVisible, () => setBackupModalVisible(false));
@@ -608,6 +630,28 @@ export default function App() {
   });
   const floatingHasInitializedRef = useRef<boolean>(false);
   const handleOpenFreeTimeFinderRef = useRef<() => void>(() => {});
+  const floatingFreeTimeEnabledRef = useRef<boolean>(floatingFreeTime);
+  floatingFreeTimeEnabledRef.current = floatingFreeTime;
+
+  // Draggable & 4-Corner Magnetized Floating "My Tasks" Button State (Non-Overlapping with Free Time)
+  const floatingTasksCornerRef = useRef<FloatingCorner>('bottom-left');
+  const floatingTasksPos = useRef(
+    new Animated.ValueXY({ x: FLOATING_EDGE_PADDING, y: FLOATING_EDGE_PADDING })
+  ).current;
+  const floatingTasksCurrentXYRef = useRef<{ x: number; y: number }>({
+    x: FLOATING_EDGE_PADDING,
+    y: FLOATING_EDGE_PADDING,
+  });
+  const floatingTasksDragOriginRef = useRef<{ x: number; y: number }>({
+    x: FLOATING_EDGE_PADDING,
+    y: FLOATING_EDGE_PADDING,
+  });
+  const floatingTasksHasInitializedRef = useRef<boolean>(false);
+  const handleOpenMyTasksModalRef = useRef<() => void>(() => {
+    setMyTasksModalVisible(true);
+  });
+  const floatingMyTasksEnabledRef = useRef<boolean>(floatingMyTasks);
+  floatingMyTasksEnabledRef.current = floatingMyTasks;
 
   useEffect(() => {
     const subId = floatingPos.addListener((val) => {
@@ -618,10 +662,20 @@ export default function App() {
     };
   }, [floatingPos]);
 
+  useEffect(() => {
+    const subId = floatingTasksPos.addListener((val) => {
+      floatingTasksCurrentXYRef.current = { x: val.x, y: val.y };
+    });
+    return () => {
+      floatingTasksPos.removeListener(subId);
+    };
+  }, [floatingTasksPos]);
+
   const getCornerCoordinates = (
     corner: FloatingCorner,
     areaW: number,
-    areaH: number
+    areaH: number,
+    stackSlotIndex = 0
   ): { x: number; y: number } => {
     const maxX = Math.max(
       FLOATING_EDGE_PADDING,
@@ -631,40 +685,126 @@ export default function App() {
       FLOATING_EDGE_PADDING,
       areaH - FLOATING_BTN_SIZE - FLOATING_EDGE_PADDING
     );
+    const stackStep = stackSlotIndex * (FLOATING_BTN_SIZE + 12);
     switch (corner) {
       case 'top-left':
-        return { x: FLOATING_EDGE_PADDING, y: FLOATING_EDGE_PADDING };
+        return {
+          x: FLOATING_EDGE_PADDING,
+          y: Math.min(maxY, FLOATING_EDGE_PADDING + stackStep),
+        };
       case 'top-right':
-        return { x: maxX, y: FLOATING_EDGE_PADDING };
+        return {
+          x: maxX,
+          y: Math.min(maxY, FLOATING_EDGE_PADDING + stackStep),
+        };
       case 'bottom-left':
-        return { x: FLOATING_EDGE_PADDING, y: maxY };
+        return {
+          x: FLOATING_EDGE_PADDING,
+          y: Math.max(FLOATING_EDGE_PADDING, maxY - stackStep),
+        };
       case 'bottom-right':
       default:
-        return { x: maxX, y: maxY };
+        return {
+          x: maxX,
+          y: Math.max(FLOATING_EDGE_PADDING, maxY - stackStep),
+        };
     }
+  };
+
+  // Enforces minimum distance between the two floating buttons during active drag so they never overlap
+  const resolveDragCollision = (
+    candidateX: number,
+    candidateY: number,
+    otherX: number,
+    otherY: number,
+    otherActive: boolean,
+    areaW: number,
+    areaH: number
+  ): { x: number; y: number } => {
+    if (!otherActive) return { x: candidateX, y: candidateY };
+    const minSep = FLOATING_BTN_SIZE + 10;
+    const dx = candidateX - otherX;
+    const dy = candidateY - otherY;
+    const dist = Math.hypot(dx, dy);
+    if (dist >= minSep) return { x: candidateX, y: candidateY };
+
+    const angle = dist > 0.001 ? Math.atan2(dy, dx) : -Math.PI / 2;
+    const minX = 4;
+    const minY = 4;
+    const maxX = Math.max(minX, areaW - FLOATING_BTN_SIZE - 4);
+    const maxY = Math.max(minY, areaH - FLOATING_BTN_SIZE - 4);
+
+    let pushedX = Math.max(
+      minX,
+      Math.min(maxX, otherX + Math.cos(angle) * minSep)
+    );
+    let pushedY = Math.max(
+      minY,
+      Math.min(maxY, otherY + Math.sin(angle) * minSep)
+    );
+
+    // If clamping near a corner kept them too close, offset vertically
+    if (Math.hypot(pushedX - otherX, pushedY - otherY) < minSep - 2) {
+      pushedY =
+        otherY >= areaH / 2
+          ? Math.max(minY, otherY - minSep)
+          : Math.min(maxY, otherY + minSep);
+    }
+    return { x: pushedX, y: pushedY };
   };
 
   useEffect(() => {
     if (calendarAreaSize.width <= 0 || calendarAreaSize.height <= 0) return;
     calendarAreaSizeRef.current = calendarAreaSize;
-    const target = getCornerCoordinates(
+    const sameCorner =
+      floatingFreeTime &&
+      floatingMyTasks &&
+      floatingCornerRef.current === floatingTasksCornerRef.current;
+
+    const freeTimeTarget = getCornerCoordinates(
       floatingCornerRef.current,
       calendarAreaSize.width,
-      calendarAreaSize.height
+      calendarAreaSize.height,
+      0
     );
+    const myTasksTarget = getCornerCoordinates(
+      floatingTasksCornerRef.current,
+      calendarAreaSize.width,
+      calendarAreaSize.height,
+      sameCorner ? 1 : 0
+    );
+
     if (!floatingHasInitializedRef.current) {
       floatingHasInitializedRef.current = true;
-      floatingPos.setValue(target);
-      floatingCurrentXYRef.current = target;
+      floatingPos.setValue(freeTimeTarget);
+      floatingCurrentXYRef.current = freeTimeTarget;
     } else {
       Animated.spring(floatingPos, {
-        toValue: target,
+        toValue: freeTimeTarget,
         useNativeDriver: false,
         bounciness: 5,
         speed: 18,
       }).start();
     }
-  }, [calendarAreaSize.width, calendarAreaSize.height]);
+
+    if (!floatingTasksHasInitializedRef.current) {
+      floatingTasksHasInitializedRef.current = true;
+      floatingTasksPos.setValue(myTasksTarget);
+      floatingTasksCurrentXYRef.current = myTasksTarget;
+    } else {
+      Animated.spring(floatingTasksPos, {
+        toValue: myTasksTarget,
+        useNativeDriver: false,
+        bounciness: 5,
+        speed: 18,
+      }).start();
+    }
+  }, [
+    calendarAreaSize.width,
+    calendarAreaSize.height,
+    floatingFreeTime,
+    floatingMyTasks,
+  ]);
 
   const floatingBtnPanResponder = useRef(
     PanResponder.create({
@@ -686,15 +826,24 @@ export default function App() {
         const maxX = Math.max(minX, areaW - FLOATING_BTN_SIZE - 4);
         const maxY = Math.max(minY, areaH - FLOATING_BTN_SIZE - 4);
 
-        const nextX = Math.max(
+        const rawX = Math.max(
           minX,
           Math.min(maxX, floatingDragOriginRef.current.x + gestureState.dx)
         );
-        const nextY = Math.max(
+        const rawY = Math.max(
           minY,
           Math.min(maxY, floatingDragOriginRef.current.y + gestureState.dy)
         );
-        floatingPos.setValue({ x: nextX, y: nextY });
+        const safeCoords = resolveDragCollision(
+          rawX,
+          rawY,
+          floatingTasksCurrentXYRef.current.x,
+          floatingTasksCurrentXYRef.current.y,
+          floatingMyTasksEnabledRef.current,
+          areaW,
+          areaH
+        );
+        floatingPos.setValue(safeCoords);
       },
       onPanResponderRelease: (_, gestureState) => {
         const movedDistance = Math.hypot(gestureState.dx, gestureState.dy);
@@ -714,25 +863,41 @@ export default function App() {
         ];
         let bestCorner: FloatingCorner = floatingCornerRef.current;
         let bestDist = Infinity;
-        let bestCoords = getCornerCoordinates(bestCorner, areaW, areaH);
 
         for (const c of corners) {
-          const coords = getCornerCoordinates(c, areaW, areaH);
+          const coords = getCornerCoordinates(c, areaW, areaH, 0);
           const d = Math.hypot(coords.x - projectedX, coords.y - projectedY);
           if (d < bestDist) {
             bestDist = d;
             bestCorner = c;
-            bestCoords = coords;
           }
         }
 
         floatingCornerRef.current = bestCorner;
+        const bestCoords = getCornerCoordinates(bestCorner, areaW, areaH, 0);
         Animated.spring(floatingPos, {
           toValue: bestCoords,
           useNativeDriver: false,
           bounciness: 6,
           speed: 16,
         }).start();
+
+        // If My Tasks button is in the same corner, shift it to stack slot 1 so they never overlap
+        if (floatingMyTasksEnabledRef.current) {
+          const sameCorner = bestCorner === floatingTasksCornerRef.current;
+          const tasksTarget = getCornerCoordinates(
+            floatingTasksCornerRef.current,
+            areaW,
+            areaH,
+            sameCorner ? 1 : 0
+          );
+          Animated.spring(floatingTasksPos, {
+            toValue: tasksTarget,
+            useNativeDriver: false,
+            bounciness: 6,
+            speed: 16,
+          }).start();
+        }
 
         if (movedDistance < 8) {
           handleOpenFreeTimeFinderRef.current();
@@ -744,9 +909,131 @@ export default function App() {
         const coords = getCornerCoordinates(
           floatingCornerRef.current,
           areaW,
-          areaH
+          areaH,
+          0
         );
         Animated.spring(floatingPos, {
+          toValue: coords,
+          useNativeDriver: false,
+          bounciness: 6,
+          speed: 16,
+        }).start();
+      },
+      onShouldBlockNativeResponder: () => true,
+    })
+  ).current;
+
+  const floatingTasksBtnPanResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onStartShouldSetPanResponderCapture: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponderCapture: () => true,
+      onPanResponderGrant: () => {
+        floatingTasksPos.stopAnimation((val) => {
+          floatingTasksCurrentXYRef.current = { x: val.x, y: val.y };
+        });
+        floatingTasksDragOriginRef.current = {
+          ...floatingTasksCurrentXYRef.current,
+        };
+      },
+      onPanResponderMove: (_, gestureState) => {
+        const areaW = calendarAreaSizeRef.current.width || 320;
+        const areaH = calendarAreaSizeRef.current.height || 480;
+        const minX = 4;
+        const minY = 4;
+        const maxX = Math.max(minX, areaW - FLOATING_BTN_SIZE - 4);
+        const maxY = Math.max(minY, areaH - FLOATING_BTN_SIZE - 4);
+
+        const rawX = Math.max(
+          minX,
+          Math.min(maxX, floatingTasksDragOriginRef.current.x + gestureState.dx)
+        );
+        const rawY = Math.max(
+          minY,
+          Math.min(maxY, floatingTasksDragOriginRef.current.y + gestureState.dy)
+        );
+        const safeCoords = resolveDragCollision(
+          rawX,
+          rawY,
+          floatingCurrentXYRef.current.x,
+          floatingCurrentXYRef.current.y,
+          floatingFreeTimeEnabledRef.current,
+          areaW,
+          areaH
+        );
+        floatingTasksPos.setValue(safeCoords);
+      },
+      onPanResponderRelease: (_, gestureState) => {
+        const movedDistance = Math.hypot(gestureState.dx, gestureState.dy);
+        const areaW = calendarAreaSizeRef.current.width || 320;
+        const areaH = calendarAreaSizeRef.current.height || 480;
+
+        const projectedX =
+          floatingTasksCurrentXYRef.current.x + gestureState.vx * 35;
+        const projectedY =
+          floatingTasksCurrentXYRef.current.y + gestureState.vy * 35;
+
+        const corners: FloatingCorner[] = [
+          'top-left',
+          'top-right',
+          'bottom-left',
+          'bottom-right',
+        ];
+        let bestCorner: FloatingCorner = floatingTasksCornerRef.current;
+        let bestDist = Infinity;
+
+        for (const c of corners) {
+          const sameAsFreeTime =
+            floatingFreeTimeEnabledRef.current &&
+            c === floatingCornerRef.current;
+          const coords = getCornerCoordinates(
+            c,
+            areaW,
+            areaH,
+            sameAsFreeTime ? 1 : 0
+          );
+          const d = Math.hypot(coords.x - projectedX, coords.y - projectedY);
+          if (d < bestDist) {
+            bestDist = d;
+            bestCorner = c;
+          }
+        }
+
+        floatingTasksCornerRef.current = bestCorner;
+        const sameCorner =
+          floatingFreeTimeEnabledRef.current &&
+          bestCorner === floatingCornerRef.current;
+        const bestCoords = getCornerCoordinates(
+          bestCorner,
+          areaW,
+          areaH,
+          sameCorner ? 1 : 0
+        );
+        Animated.spring(floatingTasksPos, {
+          toValue: bestCoords,
+          useNativeDriver: false,
+          bounciness: 6,
+          speed: 16,
+        }).start();
+
+        if (movedDistance < 8) {
+          handleOpenMyTasksModalRef.current();
+        }
+      },
+      onPanResponderTerminate: () => {
+        const areaW = calendarAreaSizeRef.current.width || 320;
+        const areaH = calendarAreaSizeRef.current.height || 480;
+        const sameCorner =
+          floatingFreeTimeEnabledRef.current &&
+          floatingTasksCornerRef.current === floatingCornerRef.current;
+        const coords = getCornerCoordinates(
+          floatingTasksCornerRef.current,
+          areaW,
+          areaH,
+          sameCorner ? 1 : 0
+        );
+        Animated.spring(floatingTasksPos, {
           toValue: coords,
           useNativeDriver: false,
           bounciness: 6,
@@ -840,8 +1127,22 @@ export default function App() {
           if (typeof parsed.floatingFreeTime === 'boolean') {
             setFloatingFreeTime(parsed.floatingFreeTime);
           }
+          if (typeof parsed.floatingMyTasks === 'boolean') {
+            setFloatingMyTasks(parsed.floatingMyTasks);
+          }
           if (typeof parsed.myCoursesPinned === 'boolean') {
             setMyCoursesPinned(parsed.myCoursesPinned);
+          }
+          if (Array.isArray(parsed.dismissedTaskIds)) {
+            const loadedDismissed = Array.from(
+              new Set(
+                parsed.dismissedTaskIds
+                  .filter((id): id is string => typeof id === 'string')
+                  .map((id) => normalizeMoodleTaskId(id))
+                  .filter(Boolean)
+              )
+            );
+            setDismissedTaskIds(loadedDismissed);
           }
           const loadedMode: PaletteMode = isValidPaletteMode(
             parsed.customPaletteMode
@@ -905,6 +1206,7 @@ export default function App() {
     exportedAt: new Date().toISOString(),
     events,
     tasks,
+    dismissedTaskIds,
     desiredCourseIds,
     lockedEvents,
     hiddenKeys,
@@ -912,6 +1214,7 @@ export default function App() {
     autoOpenMoodleLogin,
     moodleIcalUrl,
     floatingFreeTime,
+    floatingMyTasks,
     myCoursesPinned,
     customPaletteEnabled,
     customPaletteBaseHex,
@@ -940,6 +1243,7 @@ export default function App() {
     isHydratingStorage,
     events,
     tasks,
+    dismissedTaskIds,
     desiredCourseIds,
     lockedEvents,
     hiddenKeys,
@@ -947,6 +1251,7 @@ export default function App() {
     autoOpenMoodleLogin,
     moodleIcalUrl,
     floatingFreeTime,
+    floatingMyTasks,
     myCoursesPinned,
     customPaletteEnabled,
     customPaletteBaseHex,
@@ -1283,6 +1588,21 @@ export default function App() {
     return activeColorPalette[0];
   };
 
+  // Helper to check if a task is marked DONE (completed) and compute active (incomplete) tasks
+  const isTaskMarkedDone = (tsk: CourseTask): boolean =>
+    dismissedTaskIds.includes(tsk.id) ||
+    isTaskDismissed(tsk, dismissedTaskIds);
+
+  const activeTasks = useMemo(
+    () =>
+      tasks.filter(
+        (t) =>
+          !dismissedTaskIds.includes(t.id) &&
+          !isTaskDismissed(t, dismissedTaskIds)
+      ),
+    [tasks, dismissedTaskIds]
+  );
+
   // Compute active tasks falling within the currently viewed week (pinned at top of day column & on grid)
   const { currentWeekTasksByDay, currentWeekTaskEvents } = useMemo(() => {
     const byDay: Record<
@@ -1305,7 +1625,7 @@ export default function App() {
     saturdayDate.setDate(currentWeekSunday.getDate() + 6);
     const saturdayISO = toLocalDateISO(saturdayDate);
 
-    for (const tsk of tasks) {
+    for (const tsk of activeTasks) {
       if (hiddenKeys[tsk.relationKey]) continue;
 
       const d = new Date(tsk.deadlineISO);
@@ -1362,7 +1682,14 @@ export default function App() {
       currentWeekTasksByDay: byDay,
       currentWeekTaskEvents: taskGridEvents,
     };
-  }, [tasks, hiddenKeys, currentWeekDates, currentWeekSunday, activeCourseItems, events]);
+  }, [
+    activeTasks,
+    hiddenKeys,
+    currentWeekDates,
+    currentWeekSunday,
+    activeCourseItems,
+    events,
+  ]);
 
   // Feature 3: Tap-to-Create Custom Event on empty calendar slot
   const handleEmptySlotTap = (
@@ -1486,14 +1813,72 @@ export default function App() {
     setTaskModalVisible(false);
   };
 
-  const handleDeleteTask = (taskId: string) => {
-    setTasks((prev) => prev.filter((t) => t.id !== taskId));
-    setSelectedTask((prev) => (prev && prev.id === taskId ? null : prev));
+  const handleCompleteTask = (taskOrId: CourseTask | string) => {
+    const rawId = typeof taskOrId === 'string' ? taskOrId : taskOrId.id;
+    const stableDismissId = normalizeMoodleTaskId(rawId);
+    const idsToAdd = Array.from(
+      new Set([rawId, stableDismissId].filter(Boolean))
+    );
+    if (idsToAdd.length > 0) {
+      setDismissedTaskIds((prev) =>
+        Array.from(new Set([...prev, ...idsToAdd]))
+      );
+    }
+    showToastNotification('Task marked as DONE ✓', 'success');
   };
 
-  const handleMoodleTasksSynced = (incomingTasks: CourseTask[]) => {
+  const handleUndoneTask = (taskOrId: CourseTask | string) => {
+    const rawId = typeof taskOrId === 'string' ? taskOrId : taskOrId.id;
+    const stableDismissId = normalizeMoodleTaskId(rawId);
+    setDismissedTaskIds((prev) =>
+      prev.filter(
+        (id) =>
+          id !== rawId &&
+          id !== stableDismissId &&
+          normalizeMoodleTaskId(id) !== stableDismissId
+      )
+    );
+    showToastNotification('Task restored to active ↺', 'success');
+  };
+
+  const handleDeleteTask = (taskId: string) => {
+    const stableDismissId = normalizeMoodleTaskId(taskId);
+    if (stableDismissId) {
+      setDismissedTaskIds((prev) =>
+        prev.includes(stableDismissId) ? prev : [...prev, stableDismissId]
+      );
+    }
+    setTasks((prev) =>
+      prev.filter(
+        (t) =>
+          t.id !== taskId &&
+          normalizeMoodleTaskId(t.id) !== stableDismissId
+      )
+    );
+    setSelectedTask((prev) =>
+      prev &&
+      (prev.id === taskId ||
+        normalizeMoodleTaskId(prev.id) === stableDismissId)
+        ? null
+        : prev
+    );
+  };
+
+  const handleMoodleTasksSynced = (
+    incomingTasks: CourseTask[],
+    updatedDismissedIds?: string[]
+  ) => {
     if (incomingTasks.length === 0) return;
-    setTasks((prev) => mergeMoodleTasks(prev, incomingTasks).mergedTasks);
+    const baseDismissed = Array.isArray(updatedDismissedIds)
+      ? updatedDismissedIds
+      : dismissedTaskIds;
+    const reconciled = reconcileMoodleTasksWithDismissed(
+      tasks,
+      incomingTasks,
+      baseDismissed
+    );
+    setDismissedTaskIds(reconciled.updatedDismissedIds);
+    setTasks(reconciled.mergedTasks);
   };
 
   // Non-blocking Toast helper (native ToastAndroid on Android + floating in-app toast banner)
@@ -1549,6 +1934,7 @@ export default function App() {
     events,
     catalog,
     tasks,
+    dismissedTaskIds,
     desiredCourseIds,
     lockedEvents,
     hiddenKeys,
@@ -1722,10 +2108,25 @@ export default function App() {
       typeof parsed.floatingFreeTime === 'boolean'
         ? parsed.floatingFreeTime
         : floatingFreeTime;
+    const nextFloatingMyTasks =
+      typeof parsed.floatingMyTasks === 'boolean'
+        ? parsed.floatingMyTasks
+        : floatingMyTasks;
     const nextMyCoursesPinned =
       typeof parsed.myCoursesPinned === 'boolean'
         ? parsed.myCoursesPinned
         : myCoursesPinned;
+    const nextDismissedTaskIds = Array.isArray(parsed.dismissedTaskIds)
+      ? Array.from(
+          new Set(
+            parsed.dismissedTaskIds
+              .filter((id): id is string => typeof id === 'string')
+              .map((id) => normalizeMoodleTaskId(id))
+              .filter(Boolean)
+          )
+        )
+      : dismissedTaskIds;
+    const filteredIncomingTasks = incomingTasks;
 
     // Backwards-compatible restoration of Color/Palette settings
     const hasPaletteFields =
@@ -1808,7 +2209,8 @@ export default function App() {
     })();
 
     setEvents(appliedEvents);
-    setTasks(incomingTasks);
+    setTasks(filteredIncomingTasks);
+    setDismissedTaskIds(nextDismissedTaskIds);
     setDesiredCourseIds(incomingDesired);
     setLockedEvents(incomingLocked);
     setHiddenKeys(nextHiddenKeys);
@@ -1816,6 +2218,7 @@ export default function App() {
     setAutoOpenMoodleLogin(nextAutoOpenMoodle);
     setMoodleIcalUrl(nextMoodleIcalUrl);
     setFloatingFreeTime(nextFloatingFreeTime);
+    setFloatingMyTasks(nextFloatingMyTasks);
     setMyCoursesPinned(nextMyCoursesPinned);
     setCustomPaletteEnabled(nextCustomPaletteEnabled);
     setCustomPaletteMode(nextCustomPaletteMode);
@@ -1834,7 +2237,8 @@ export default function App() {
 
     const restoredPayload = buildLocalBackupPayloadRef.current({
       events: appliedEvents,
-      tasks: incomingTasks,
+      tasks: filteredIncomingTasks,
+      dismissedTaskIds: nextDismissedTaskIds,
       desiredCourseIds: incomingDesired,
       lockedEvents: incomingLocked,
       hiddenKeys: nextHiddenKeys,
@@ -1842,6 +2246,7 @@ export default function App() {
       autoOpenMoodleLogin: nextAutoOpenMoodle,
       moodleIcalUrl: nextMoodleIcalUrl,
       floatingFreeTime: nextFloatingFreeTime,
+      floatingMyTasks: nextFloatingMyTasks,
       myCoursesPinned: nextMyCoursesPinned,
       customPaletteEnabled: nextCustomPaletteEnabled,
       customPaletteBaseHex: nextCustomPaletteBaseHex,
@@ -1960,6 +2365,7 @@ export default function App() {
     currentUser?.uid,
     events,
     tasks,
+    dismissedTaskIds,
     desiredCourseIds,
     lockedEvents,
     hiddenKeys,
@@ -1967,6 +2373,7 @@ export default function App() {
     autoOpenMoodleLogin,
     moodleIcalUrl,
     floatingFreeTime,
+    floatingMyTasks,
     myCoursesPinned,
     customPaletteEnabled,
     customPaletteBaseHex,
@@ -2560,13 +2967,13 @@ export default function App() {
 
   // Custom Event Creation with explicit "Create New Group" vs existing group assignment
   const handleAddCustomEvent = () => {
-    const start = parseFloat(customStart);
-    const end = parseFloat(customEnd);
+    const start = timeValueToDecimalHour(customStart);
+    const end = timeValueToDecimalHour(customEnd);
     const trimmedTitle = customTitle.trim();
     if (!trimmedTitle || isNaN(start) || isNaN(end) || end <= start) {
       Alert.alert(
         'Invalid Input',
-        'Please enter a valid title and start/end hours.'
+        'Please enter a valid title and ensure End Time is after Start Time.'
       );
       return;
     }
@@ -2870,6 +3277,19 @@ export default function App() {
                 <Text style={styles.spoonMenuItemText}>📝 Task</Text>
               </TouchableOpacity>
 
+              <TouchableOpacity
+                style={styles.spoonMenuItem}
+                onPress={() => {
+                  setSpoonMenuVisible(false);
+                  setMyTasksModalVisible(true);
+                }}
+              >
+                <Text style={styles.spoonMenuItemText}>
+                  📋 My Tasks
+                  {activeTasks.length > 0 ? ` (${activeTasks.length})` : ''}
+                </Text>
+              </TouchableOpacity>
+
               {!floatingFreeTime && (
                 <TouchableOpacity
                   style={styles.spoonMenuItem}
@@ -3108,6 +3528,24 @@ export default function App() {
                       onValueChange={setFloatingFreeTime}
                       trackColor={{ false: '#374151', true: '#2563EB' }}
                       thumbColor={floatingFreeTime ? '#FFFFFF' : '#9CA3AF'}
+                    />
+                  </View>
+
+                  {/* Feature: "Floating My Tasks" Toggle */}
+                  <View style={styles.settingsOptionRow}>
+                    <Text
+                      style={[
+                        styles.settingsOptionText,
+                        styles.settingsToggleLabelText,
+                      ]}
+                    >
+                      Floating My Tasks
+                    </Text>
+                    <Switch
+                      value={floatingMyTasks}
+                      onValueChange={setFloatingMyTasks}
+                      trackColor={{ false: '#374151', true: '#2563EB' }}
+                      thumbColor={floatingMyTasks ? '#FFFFFF' : '#9CA3AF'}
                     />
                   </View>
 
@@ -3712,6 +4150,32 @@ export default function App() {
                 <Text style={styles.floatingFreeTimeEmoji}>🕒</Text>
               </Animated.View>
             )}
+
+            {/* Feature: Draggable & Non-Overlapping Floating "My Tasks" Button */}
+            {floatingMyTasks && (
+              <Animated.View
+                {...floatingTasksBtnPanResponder.panHandlers}
+                style={[
+                  styles.floatingFreeTimeBtn,
+                  styles.floatingMyTasksBtn,
+                  {
+                    transform: [
+                      { translateX: floatingTasksPos.x },
+                      { translateY: floatingTasksPos.y },
+                    ],
+                  },
+                ]}
+              >
+                <Text style={styles.floatingFreeTimeEmoji}>📋</Text>
+                {activeTasks.length > 0 && (
+                  <View style={styles.floatingTasksCountBadge}>
+                    <Text style={styles.floatingTasksCountBadgeText}>
+                      {activeTasks.length > 99 ? '99+' : activeTasks.length}
+                    </Text>
+                  </View>
+                )}
+              </Animated.View>
+            )}
           </View>
 
           {/* MY COURSES SECTION (Bottom in Portrait, Side Panel in Landscape) */}
@@ -3744,7 +4208,7 @@ export default function App() {
                   </Text>
                 </TouchableOpacity>
                 <Text style={styles.myCoursesTitle}>
-                  My Courses ({activeCourseItems.length}) • Tasks ({tasks.length})
+                  My Courses ({activeCourseItems.length}) • Tasks ({activeTasks.length})
                 </Text>
               </View>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
@@ -3787,7 +4251,7 @@ export default function App() {
                         doesCourseIdMatch(ex.courseId, item.courseId)
                       )
                     : [];
-                  const courseTasks = tasks.filter(
+                  const courseTasks = activeTasks.filter(
                     (t) =>
                       t.relationKey === item.relationKey ||
                       (item.courseId &&
@@ -4464,24 +4928,66 @@ export default function App() {
 
               <View style={{ flexDirection: 'row', gap: 10 }}>
                 <View style={{ flex: 1 }}>
-                  <Text style={styles.sectionLabel}>Start Hour (e.g. 14.5):</Text>
-                  <TextInput
-                    style={styles.searchInput}
-                    keyboardType="numeric"
-                    value={customStart}
-                    onChangeText={setCustomStart}
-                  />
+                  <Text style={styles.sectionLabel}>Start Time:</Text>
+                  <TouchableOpacity
+                    activeOpacity={0.8}
+                    style={styles.timePickerTriggerBtn}
+                    onPress={() => setClockPickerTarget('start')}
+                  >
+                    <Text style={styles.timePickerTriggerIcon}>🕒</Text>
+                    <Text style={styles.timePickerTriggerText}>
+                      {formatDecimalHourToHHMM(customStart)}
+                    </Text>
+                  </TouchableOpacity>
                 </View>
                 <View style={{ flex: 1 }}>
-                  <Text style={styles.sectionLabel}>End Hour (e.g. 17.5):</Text>
-                  <TextInput
-                    style={styles.searchInput}
-                    keyboardType="numeric"
-                    value={customEnd}
-                    onChangeText={setCustomEnd}
-                  />
+                  <Text style={styles.sectionLabel}>End Time:</Text>
+                  <TouchableOpacity
+                    activeOpacity={0.8}
+                    style={styles.timePickerTriggerBtn}
+                    onPress={() => setClockPickerTarget('end')}
+                  >
+                    <Text style={styles.timePickerTriggerIcon}>🕒</Text>
+                    <Text style={styles.timePickerTriggerText}>
+                      {formatDecimalHourToHHMM(customEnd)}
+                    </Text>
+                  </TouchableOpacity>
                 </View>
               </View>
+
+              <ClockTimePickerModal
+                visible={clockPickerTarget !== null}
+                label={
+                  clockPickerTarget === 'end'
+                    ? 'Select End Time (24h)'
+                    : 'Select Start Time (24h)'
+                }
+                initialDecimalHour={
+                  clockPickerTarget === 'end'
+                    ? timeValueToDecimalHour(customEnd)
+                    : timeValueToDecimalHour(customStart)
+                }
+                accentColor={
+                  (selectedAssignedGroup
+                    ? selectedAssignedGroup.color
+                    : customColor) ||
+                  activeColorPalette[0] ||
+                  '#3B82F6'
+                }
+                onCancel={() => setClockPickerTarget(null)}
+                onConfirm={(decimalHour) => {
+                  if (clockPickerTarget === 'start') {
+                    setCustomStart(String(decimalHour));
+                    const currentEndDec = timeValueToDecimalHour(customEnd);
+                    if (currentEndDec <= decimalHour) {
+                      setCustomEnd(String(Math.min(23.75, decimalHour + 1)));
+                    }
+                  } else if (clockPickerTarget === 'end') {
+                    setCustomEnd(String(decimalHour));
+                  }
+                  setClockPickerTarget(null);
+                }}
+              />
 
               {!selectedAssignedGroup && (
                 <>
@@ -5199,9 +5705,36 @@ export default function App() {
                   <View
                     style={[
                       styles.inspectorActions,
-                      { marginTop: 14, gap: 10 },
+                      { marginTop: 14, gap: 8 },
                     ]}
                   >
+                    <TouchableOpacity
+                      style={[
+                        styles.btn,
+                        {
+                          backgroundColor: isTaskMarkedDone(selectedTask)
+                            ? '#6B7280'
+                            : '#10B981',
+                          paddingVertical: 10,
+                          paddingHorizontal: 14,
+                        },
+                      ]}
+                      onPress={() => {
+                        const targetTask = selectedTask;
+                        setSelectedTask(null);
+                        if (isTaskMarkedDone(targetTask)) {
+                          handleUndoneTask(targetTask);
+                        } else {
+                          handleCompleteTask(targetTask);
+                        }
+                      }}
+                    >
+                      <Text style={styles.btnText}>
+                        {isTaskMarkedDone(selectedTask)
+                          ? '↺ UNDONE'
+                          : '✓ DONE'}
+                      </Text>
+                    </TouchableOpacity>
                     <TouchableOpacity
                       style={[
                         styles.btn,
@@ -5217,7 +5750,7 @@ export default function App() {
                         handleDeleteTask(idToRemove);
                       }}
                     >
-                      <Text style={styles.btnText}>🗑️ Delete Task</Text>
+                      <Text style={styles.btnText}>🗑️ Delete</Text>
                     </TouchableOpacity>
 
                     <TouchableOpacity
@@ -5236,6 +5769,267 @@ export default function App() {
                   </View>
                 </>
               )}
+            </View>
+          </View>
+        </Modal>
+
+        {/* MODAL 6C: "MY TASKS" MODAL (ALL TASKS SORTED BY URGENCY WITH OVERDUE HIGHLIGHT, SHOW DONE TOGGLE & DONE/UNDONE) */}
+        <Modal
+          visible={myTasksModalVisible}
+          transparent
+          animationType="slide"
+          onRequestClose={() => setMyTasksModalVisible(false)}
+        >
+          <View style={styles.bottomSheetBackdrop}>
+            <View style={styles.bottomSheetCard}>
+              <View style={styles.modalHeader}>
+                <View style={{ flex: 1, marginRight: 8 }}>
+                  <Text style={styles.modalTitle}>
+                    📋 My Tasks ({activeTasks.length} active
+                    {tasks.length - activeTasks.length > 0
+                      ? ` • ${tasks.length - activeTasks.length} done`
+                      : ''}
+                    )
+                  </Text>
+                  <Text style={styles.freeTimeSubHeader}>
+                    Active tasks sorted by urgency • Completed tasks at bottom
+                  </Text>
+                </View>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                  {activeCourseItems.length > 0 && (
+                    <TouchableOpacity
+                      style={[styles.btn, { backgroundColor: '#EC4899' }]}
+                      onPress={() => {
+                        setMyTasksModalVisible(false);
+                        handleOpenTaskModal();
+                      }}
+                    >
+                      <Text style={styles.btnText}>+ Task</Text>
+                    </TouchableOpacity>
+                  )}
+                  <TouchableOpacity onPress={() => setMyTasksModalVisible(false)}>
+                    <Text style={styles.closeText}>Close</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+
+              {/* Header Toggle: "Show Done" (default: true / ON) */}
+              <View style={styles.myTasksShowDoneBar}>
+                <Text style={styles.myTasksShowDoneLabel}>
+                  Show Done ({tasks.length - activeTasks.length})
+                </Text>
+                <Switch
+                  value={showDoneTasks}
+                  onValueChange={setShowDoneTasks}
+                  trackColor={{ false: '#D1D5DB', true: '#10B981' }}
+                  thumbColor="#FFFFFF"
+                />
+              </View>
+
+              {(() => {
+                const visibleTasks = tasks
+                  .filter((tsk) => showDoneTasks || !isTaskMarkedDone(tsk))
+                  .sort((a, b) => {
+                    const doneA = isTaskMarkedDone(a);
+                    const doneB = isTaskMarkedDone(b);
+                    // Active (incomplete) tasks always render first; completed tasks pushed to the bottom
+                    if (doneA !== doneB) {
+                      return doneA ? 1 : -1;
+                    }
+                    const tA = new Date(a.deadlineISO).getTime();
+                    const tB = new Date(b.deadlineISO).getTime();
+                    if (Number.isNaN(tA) && Number.isNaN(tB)) return 0;
+                    if (Number.isNaN(tA)) return 1;
+                    if (Number.isNaN(tB)) return -1;
+                    return tA - tB;
+                  });
+
+                if (visibleTasks.length === 0) {
+                  return (
+                    <View style={styles.emptyFreeTimeBox}>
+                      <Text style={styles.emptyFreeTimeTitle}>
+                        🎉 No Pending Tasks!
+                      </Text>
+                      <Text style={styles.emptyFreeTimeSub}>
+                        {tasks.length > 0 && !showDoneTasks
+                          ? 'All tasks are completed! Turn on "Show Done" above to view or undo completed tasks.'
+                          : 'All your assignments are done. Sync Moodle/Webwork in Settings or tap "+ Task" to add a manual assignment.'}
+                      </Text>
+                    </View>
+                  );
+                }
+
+                return (
+                  <ScrollView
+                    style={{ maxHeight: 420 }}
+                    showsVerticalScrollIndicator={false}
+                  >
+                    {visibleTasks.map((tsk) => {
+                      const isDone = isTaskMarkedDone(tsk);
+                      const nowMs = nowDate.getTime();
+                      const deadlineDate = new Date(tsk.deadlineISO);
+                      const deadlineMs = deadlineDate.getTime();
+                      const isOverdue =
+                        !isDone &&
+                        !Number.isNaN(deadlineMs) &&
+                        deadlineMs < nowMs;
+                      const countdown = formatTaskCountdown(
+                        tsk.deadlineISO,
+                        nowMs
+                      );
+                      const taskColor = getTaskCourseColor(tsk);
+                      const formattedDue = (() => {
+                        if (Number.isNaN(deadlineMs)) return tsk.deadlineISO;
+                        const dayLabel = DAYS[deadlineDate.getDay()] || '';
+                        const dd = String(deadlineDate.getDate()).padStart(
+                          2,
+                          '0'
+                        );
+                        const mm = String(
+                          deadlineDate.getMonth() + 1
+                        ).padStart(2, '0');
+                        const yyyy = deadlineDate.getFullYear();
+                        const hh = String(deadlineDate.getHours()).padStart(
+                          2,
+                          '0'
+                        );
+                        const min = String(deadlineDate.getMinutes()).padStart(
+                          2,
+                          '0'
+                        );
+                        return `${dayLabel} ${dd}/${mm}/${yyyy} • ${hh}:${min}`;
+                      })();
+
+                      return (
+                        <View
+                          key={tsk.id}
+                          style={[
+                            styles.myTasksItemCard,
+                            {
+                              borderLeftColor: isDone
+                                ? '#9CA3AF'
+                                : isOverdue
+                                ? '#DC2626'
+                                : taskColor,
+                            },
+                            isOverdue && styles.myTasksItemCardOverdue,
+                            isDone && styles.myTasksItemCardDone,
+                          ]}
+                        >
+                          <TouchableOpacity
+                            style={{ flex: 1, marginRight: 10 }}
+                            activeOpacity={0.75}
+                            onPress={() => {
+                              setMyTasksModalVisible(false);
+                              setSelectedTask({ ...tsk, color: taskColor });
+                            }}
+                          >
+                            <View style={styles.myTasksItemHeaderRow}>
+                              <View
+                                style={[
+                                  styles.myTasksCourseBadge,
+                                  { backgroundColor: taskColor },
+                                ]}
+                              >
+                                <Text
+                                  style={styles.myTasksCourseBadgeText}
+                                  numberOfLines={1}
+                                >
+                                  {tsk.courseId
+                                    ? `${tsk.courseId} • ${
+                                        tsk.courseTitle ||
+                                        tsk.groupTitle ||
+                                        'Course'
+                                      }`
+                                    : tsk.courseTitle ||
+                                      tsk.groupTitle ||
+                                      'Course'}
+                                </Text>
+                              </View>
+
+                              {isDone ? (
+                                <View style={styles.myTasksCompletedBadge}>
+                                  <Text style={styles.myTasksCompletedBadgeText}>
+                                    ✓ COMPLETED
+                                  </Text>
+                                </View>
+                              ) : (
+                                isOverdue && (
+                                  <View style={styles.myTasksOverdueBadge}>
+                                    <Text style={styles.myTasksOverdueBadgeText}>
+                                      ⚠️ OVERDUE
+                                    </Text>
+                                  </View>
+                                )
+                              )}
+
+                              {tsk.source && (
+                                <Text style={styles.myTasksSourceLabel}>
+                                  {tsk.source === 'Moodle'
+                                    ? '🎓 Moodle'
+                                    : tsk.source === 'Webwork'
+                                    ? '💻 Webwork'
+                                    : '📝 Manual'}
+                                </Text>
+                              )}
+                            </View>
+
+                            <Text
+                              style={[
+                                styles.myTasksItemTitle,
+                                isDone && styles.myTasksItemTitleDone,
+                              ]}
+                              numberOfLines={2}
+                            >
+                              {tsk.title}
+                            </Text>
+
+                            <Text style={styles.myTasksItemDueText}>
+                              📅 {formattedDue}
+                            </Text>
+
+                            <Text
+                              style={[
+                                styles.myTasksItemCountdown,
+                                !isDone &&
+                                  (isOverdue || countdown.isUrgent) &&
+                                  styles.myTasksItemCountdownUrgent,
+                                isDone && { color: '#6B7280' },
+                              ]}
+                            >
+                              {isDone
+                                ? '✓ Marked as Done'
+                                : `${isOverdue ? '🚨 ' : '⏳ '}${countdown.text}`}
+                            </Text>
+                          </TouchableOpacity>
+
+                          {isDone ? (
+                            <TouchableOpacity
+                              activeOpacity={0.8}
+                              style={styles.myTasksUndoneBtn}
+                              onPress={() => handleUndoneTask(tsk)}
+                            >
+                              <Text style={styles.myTasksUndoneBtnText}>
+                                UNDONE
+                              </Text>
+                            </TouchableOpacity>
+                          ) : (
+                            <TouchableOpacity
+                              activeOpacity={0.8}
+                              style={styles.myTasksDoneBtn}
+                              onPress={() => handleCompleteTask(tsk)}
+                            >
+                              <Text style={styles.myTasksDoneBtnText}>
+                                ✓ DONE
+                              </Text>
+                            </TouchableOpacity>
+                          )}
+                        </View>
+                      );
+                    })}
+                  </ScrollView>
+                );
+              })()}
             </View>
           </View>
         </Modal>
@@ -5484,6 +6278,185 @@ const styles = StyleSheet.create({
   },
   floatingFreeTimeEmoji: {
     fontSize: 24,
+  },
+  floatingMyTasksBtn: {
+    borderColor: '#10B981',
+  },
+  floatingTasksCountBadge: {
+    position: 'absolute',
+    top: -4,
+    right: -4,
+    minWidth: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: '#EF4444',
+    borderWidth: 1.5,
+    borderColor: '#111827',
+    paddingHorizontal: 4,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  floatingTasksCountBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '800',
+  },
+  timePickerTriggerBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: '#F3F4F6',
+    borderWidth: 1.5,
+    borderColor: '#D1D5DB',
+    borderRadius: 10,
+    paddingVertical: 11,
+    paddingHorizontal: 12,
+    marginBottom: 10,
+  },
+  timePickerTriggerIcon: {
+    fontSize: 16,
+  },
+  timePickerTriggerText: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#111827',
+    fontVariant: ['tabular-nums'],
+  },
+  myTasksShowDoneBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#F3F4F6',
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    marginBottom: 10,
+  },
+  myTasksShowDoneLabel: {
+    color: '#374151',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  myTasksItemCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#F9FAFB',
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    borderLeftWidth: 5,
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 10,
+  },
+  myTasksItemCardOverdue: {
+    backgroundColor: '#FEF2F2',
+    borderColor: '#FCA5A5',
+  },
+  myTasksItemCardDone: {
+    opacity: 0.55,
+    backgroundColor: '#F3F4F6',
+  },
+  myTasksItemHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginBottom: 5,
+  },
+  myTasksCourseBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 2.5,
+    borderRadius: 6,
+    maxWidth: '72%',
+  },
+  myTasksCourseBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 10.5,
+    fontWeight: '700',
+  },
+  myTasksOverdueBadge: {
+    backgroundColor: '#DC2626',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 5,
+  },
+  myTasksOverdueBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 9.5,
+    fontWeight: '800',
+  },
+  myTasksCompletedBadge: {
+    backgroundColor: '#E5E7EB',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 5,
+  },
+  myTasksCompletedBadgeText: {
+    color: '#4B5563',
+    fontSize: 9.5,
+    fontWeight: '800',
+  },
+  myTasksSourceLabel: {
+    color: '#6B7280',
+    fontSize: 10.5,
+    fontWeight: '700',
+  },
+  myTasksItemTitle: {
+    color: '#111827',
+    fontSize: 14.5,
+    fontWeight: '800',
+    marginBottom: 3,
+  },
+  myTasksItemTitleDone: {
+    textDecorationLine: 'line-through',
+    color: '#4B5563',
+  },
+  myTasksItemDueText: {
+    color: '#4B5563',
+    fontSize: 12,
+    fontWeight: '600',
+    marginBottom: 2,
+  },
+  myTasksItemCountdown: {
+    color: '#2563EB',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  myTasksItemCountdownUrgent: {
+    color: '#DC2626',
+    fontWeight: '800',
+  },
+  myTasksDoneBtn: {
+    backgroundColor: '#10B981',
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 13,
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 2,
+  },
+  myTasksDoneBtnText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  myTasksUndoneBtn: {
+    backgroundColor: '#6B7280',
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 1,
+  },
+  myTasksUndoneBtnText: {
+    color: '#FFFFFF',
+    fontSize: 11.5,
+    fontWeight: '800',
   },
   header: {
     flexDirection: 'row',

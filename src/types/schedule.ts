@@ -88,7 +88,9 @@ export interface LocalBackupPayload {
   autoOpenMoodleLogin?: boolean;
   moodleIcalUrl?: string;
   floatingFreeTime?: boolean;
+  floatingMyTasks?: boolean;
   myCoursesPinned?: boolean;
+  dismissedTaskIds?: string[];
   customPaletteEnabled?: boolean;
   customPaletteBaseHex?: string;
   customPaletteMode?: PaletteMode;

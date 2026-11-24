@@ -9,6 +9,7 @@ export interface MoodleSyncProps {
   events: ScheduleEvent[];
   catalog: CourseCatalogItem[];
   tasks: CourseTask[];
+  dismissedTaskIds: string[];
   desiredCourseIds: string[];
   lockedEvents: ScheduleEvent[];
   hiddenKeys: Record<string, boolean>;
@@ -20,6 +21,9 @@ export interface MoodleSyncProps {
   modalVisible: boolean;
   onChangeModalVisible: (visible: boolean) => void;
   onCloseSettings: () => void;
-  onTasksSynced: (incomingTasks: CourseTask[]) => void;
+  onTasksSynced: (
+    incomingTasks: CourseTask[],
+    updatedDismissedIds?: string[]
+  ) => void;
   onShowToast: (message: string, variant: 'success' | 'warning') => void;
 }

@@ -39,6 +39,7 @@ export default function MoodleSync({
   events,
   catalog,
   tasks,
+  dismissedTaskIds,
   desiredCourseIds,
   lockedEvents,
   hiddenKeys,
@@ -92,6 +93,7 @@ export default function MoodleSync({
   const buildStateSnapshot = (): PersistedStateSnapshot => ({
     events,
     tasks,
+    dismissedTaskIds,
     desiredCourseIds,
     lockedEvents,
     hiddenKeys,
@@ -108,12 +110,13 @@ export default function MoodleSync({
       return { totalCount: 0, newlyAddedCount: 0 };
     }
 
-    const { newlyAddedCount } = await persistMoodleTasksToStorage(
-      syncedTasks,
-      buildStateSnapshot(),
-      isHydratingStorage
-    );
-    onTasksSynced(syncedTasks);
+    const { newlyAddedCount, updatedDismissedIds } =
+      await persistMoodleTasksToStorage(
+        syncedTasks,
+        buildStateSnapshot(),
+        isHydratingStorage
+      );
+    onTasksSynced(syncedTasks, updatedDismissedIds);
 
     return {
       totalCount: syncedTasks.length,
