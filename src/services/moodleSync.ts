@@ -7,6 +7,7 @@ import {
   LocalBackupPayload,
   ScheduleEvent,
 } from '../types/schedule';
+import { refreshAllWidgets } from './widgetUpdater';
 
 export const MOODLE_LOGIN_URL = 'https://moodle.technion.ac.il/';
 export const MOODLE_CALENDAR_EXPORT_URL =
@@ -1036,6 +1037,7 @@ export async function persistMoodleTasksToStorage(
 
   try {
     await AsyncStorage.setItem(ASYNC_STORAGE_KEY, JSON.stringify(nextPayload));
+    await refreshAllWidgets();
   } catch (err) {
     console.warn('Failed to save synced Moodle tasks to AsyncStorage:', err);
   }

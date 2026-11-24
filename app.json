@@ -34,7 +34,36 @@
       "expo-status-bar",
       "expo-web-browser",
       "expo-sharing",
-      "@react-native-google-signin/google-signin"
+      "@react-native-google-signin/google-signin",
+      [
+        "react-native-android-widget",
+        {
+          "widgets": [
+            {
+              "name": "DailyScheduleWidget",
+              "label": "MeatSpoon - Daily Schedule",
+              "description": "Today's Technion classes, pinned tasks & live timeline",
+              "minWidth": "110dp",
+              "minHeight": "180dp",
+              "targetCellWidth": 2,
+              "targetCellHeight": 4,
+              "resizeMode": "horizontal|vertical",
+              "updatePeriodMillis": 1800000
+            },
+            {
+              "name": "FreeTimeWidget",
+              "label": "MeatSpoon - Free Time",
+              "description": "1x1 Free Time status clock & one-tap spontaneous finder",
+              "minWidth": "40dp",
+              "minHeight": "40dp",
+              "targetCellWidth": 1,
+              "targetCellHeight": 1,
+              "resizeMode": "none",
+              "updatePeriodMillis": 1800000
+            }
+          ]
+        }
+      ]
     ],
     "extra": {
       "eas": {

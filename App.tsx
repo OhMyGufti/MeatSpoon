@@ -18,6 +18,7 @@ import {
   Platform,
   ToastAndroid,
   Switch,
+  AppState,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
@@ -88,6 +89,13 @@ import {
   signInWithGoogle,
   signOutFromGoogle,
 } from './src/services/googleAuth';
+import {
+  initAndroidWidgetTaskHandler,
+  refreshAllWidgets,
+} from './src/services/widgetUpdater';
+
+initAndroidWidgetTaskHandler();
+const FREE_TIME_DURATION_OPTIONS = [1, 2, 3, 4, 5, 6, 7, 8] as const;
 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu'];
 // Feature 1: RTL Schedule Layout (Sunday = 0 on the far right, Thursday = 4 on the far left)
@@ -505,6 +513,9 @@ export default function App() {
   const [moodleIcalUrl, setMoodleIcalUrl] = useState<string>('');
   const [floatingFreeTime, setFloatingFreeTime] = useState<boolean>(false);
   const [floatingMyTasks, setFloatingMyTasks] = useState<boolean>(false);
+  const [freeTimeDuration, setFreeTimeDuration] = useState<number>(2);
+  const [freeTimeDurationDropdownOpen, setFreeTimeDurationDropdownOpen] =
+    useState<boolean>(false);
   const [myCoursesPinned, setMyCoursesPinned] = useState<boolean>(true);
   const [dismissedTaskIds, setDismissedTaskIds] = useState<string[]>([]);
   const [myTasksModalVisible, setMyTasksModalVisible] = useState<boolean>(false);
@@ -1130,6 +1141,13 @@ export default function App() {
           if (typeof parsed.floatingMyTasks === 'boolean') {
             setFloatingMyTasks(parsed.floatingMyTasks);
           }
+          if (
+            typeof parsed.freeTimeDuration === 'number' &&
+            parsed.freeTimeDuration >= 1 &&
+            parsed.freeTimeDuration <= 8
+          ) {
+            setFreeTimeDuration(Math.round(parsed.freeTimeDuration));
+          }
           if (typeof parsed.myCoursesPinned === 'boolean') {
             setMyCoursesPinned(parsed.myCoursesPinned);
           }
@@ -1215,6 +1233,7 @@ export default function App() {
     moodleIcalUrl,
     floatingFreeTime,
     floatingMyTasks,
+    freeTimeDuration,
     myCoursesPinned,
     customPaletteEnabled,
     customPaletteBaseHex,
@@ -1233,6 +1252,7 @@ export default function App() {
       try {
         const payload = buildLocalBackupPayload();
         await AsyncStorage.setItem(ASYNC_STORAGE_KEY, JSON.stringify(payload));
+        await refreshAllWidgets();
       } catch (err) {
         console.warn('Failed to save schedule state to AsyncStorage:', err);
       }
@@ -1252,12 +1272,58 @@ export default function App() {
     moodleIcalUrl,
     floatingFreeTime,
     floatingMyTasks,
+    freeTimeDuration,
     myCoursesPinned,
     customPaletteEnabled,
     customPaletteBaseHex,
     customPaletteMode,
     customPalette,
   ]);
+
+  // Refresh Android Home Screen Widgets on app launch/resume
+  useEffect(() => {
+    if (isHydratingStorage) return;
+    refreshAllWidgets();
+
+    const sub = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'active') {
+        refreshAllWidgets();
+      }
+    });
+    return () => {
+      sub.remove();
+    };
+  }, [isHydratingStorage]);
+
+  // Deep-link listener for `meatspoon://free-time` (triggered by the 1x1 FreeTimeWidget)
+  const initialDeepLinkHandledRef = useRef<boolean>(false);
+  useEffect(() => {
+    if (isHydratingStorage) return;
+
+    const handleDeepLinkUrl = (url?: string | null) => {
+      if (!url) return;
+      if (url.toLowerCase().includes('free-time')) {
+        handleOpenFreeTimeFinderRef.current();
+      }
+    };
+
+    if (!initialDeepLinkHandledRef.current) {
+      initialDeepLinkHandledRef.current = true;
+      Linking.getInitialURL()
+        .then((initialUrl) => {
+          handleDeepLinkUrl(initialUrl);
+        })
+        .catch(() => {});
+    }
+
+    const linkSub = Linking.addEventListener('url', (event) => {
+      handleDeepLinkUrl(event.url);
+    });
+
+    return () => {
+      linkSub.remove();
+    };
+  }, [isHydratingStorage]);
 
   // Feature 1: Automatic Startup Course Data Sync & Offline Caching
   useEffect(() => {
@@ -2112,6 +2178,12 @@ export default function App() {
       typeof parsed.floatingMyTasks === 'boolean'
         ? parsed.floatingMyTasks
         : floatingMyTasks;
+    const nextFreeTimeDuration =
+      typeof parsed.freeTimeDuration === 'number' &&
+      parsed.freeTimeDuration >= 1 &&
+      parsed.freeTimeDuration <= 8
+        ? Math.round(parsed.freeTimeDuration)
+        : freeTimeDuration;
     const nextMyCoursesPinned =
       typeof parsed.myCoursesPinned === 'boolean'
         ? parsed.myCoursesPinned
@@ -2219,6 +2291,7 @@ export default function App() {
     setMoodleIcalUrl(nextMoodleIcalUrl);
     setFloatingFreeTime(nextFloatingFreeTime);
     setFloatingMyTasks(nextFloatingMyTasks);
+    setFreeTimeDuration(nextFreeTimeDuration);
     setMyCoursesPinned(nextMyCoursesPinned);
     setCustomPaletteEnabled(nextCustomPaletteEnabled);
     setCustomPaletteMode(nextCustomPaletteMode);
@@ -2247,6 +2320,7 @@ export default function App() {
       moodleIcalUrl: nextMoodleIcalUrl,
       floatingFreeTime: nextFloatingFreeTime,
       floatingMyTasks: nextFloatingMyTasks,
+      freeTimeDuration: nextFreeTimeDuration,
       myCoursesPinned: nextMyCoursesPinned,
       customPaletteEnabled: nextCustomPaletteEnabled,
       customPaletteBaseHex: nextCustomPaletteBaseHex,
@@ -2374,6 +2448,7 @@ export default function App() {
     moodleIcalUrl,
     floatingFreeTime,
     floatingMyTasks,
+    freeTimeDuration,
     myCoursesPinned,
     customPaletteEnabled,
     customPaletteBaseHex,
@@ -2504,11 +2579,13 @@ export default function App() {
   // of every followed course, even if the user only follows a single lecture or tutorial.
   const computeSpontaneousEventsForCatalog = (
     activeCatalog: CourseCatalogItem[],
-    refDate: Date
+    refDate: Date,
+    durationHours: number = freeTimeDuration
   ): SpontaneousEventItem[] => {
     const currentDay = refDate.getDay(); // 0 = Sun .. 6 = Sat
     const currentDecHour = refDate.getHours() + refDate.getMinutes() / 60;
-    const windowEndHour = currentDecHour + 2.0;
+    const safeDuration = Math.max(1, Math.min(8, Math.round(durationHours || 2)));
+    const windowEndHour = currentDecHour + safeDuration;
 
     const results: SpontaneousEventItem[] = [];
     const seenKeys = new Set<string>();
@@ -2672,9 +2749,20 @@ export default function App() {
   useEffect(() => {
     if (!freeTimeModalVisible || !freeTimeCheckedAt) return;
     setSpontaneousEvents(
-      computeSpontaneousEventsForCatalog(catalog, freeTimeCheckedAt)
+      computeSpontaneousEventsForCatalog(
+        catalog,
+        freeTimeCheckedAt,
+        freeTimeDuration
+      )
     );
-  }, [freeTimeModalVisible, catalog, events, trackedCourseIds, includedSpecialGroups]);
+  }, [
+    freeTimeModalVisible,
+    catalog,
+    events,
+    trackedCourseIds,
+    includedSpecialGroups,
+    freeTimeDuration,
+  ]);
 
   // Handle Single Tap (Highlight) vs Double Tap (Visibility Toggle: isHidden) on "My Courses" items
   const handleMyCourseItemPress = (relationKey: string) => {
@@ -3547,6 +3635,67 @@ export default function App() {
                       trackColor={{ false: '#374151', true: '#2563EB' }}
                       thumbColor={floatingMyTasks ? '#FFFFFF' : '#9CA3AF'}
                     />
+                  </View>
+
+                  {/* Feature: "Free Time Duration" Dropdown/Picker (1h - 8h, default 2h) */}
+                  <View style={styles.settingsDurationContainer}>
+                    <View style={styles.settingsDurationHeaderRow}>
+                      <View style={{ flex: 1, marginRight: 10 }}>
+                        <Text style={styles.settingsOptionText}>
+                          🕒 Free Time Duration
+                        </Text>
+                        <Text style={styles.settingsPaletteSubText}>
+                          Lookahead window for Free Time & Android widget
+                        </Text>
+                      </View>
+                      <TouchableOpacity
+                        activeOpacity={0.8}
+                        style={styles.settingsDurationDropdownBtn}
+                        onPress={() =>
+                          setFreeTimeDurationDropdownOpen((prev) => !prev)
+                        }
+                      >
+                        <Text style={styles.settingsDurationDropdownBtnText}>
+                          {freeTimeDuration}h
+                        </Text>
+                        <Text style={styles.settingsDurationDropdownArrow}>
+                          {freeTimeDurationDropdownOpen ? '▲' : '▼'}
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+
+                    {freeTimeDurationDropdownOpen && (
+                      <View style={styles.settingsDurationChipsGrid}>
+                        {FREE_TIME_DURATION_OPTIONS.map((hrs) => {
+                          const isSelected = freeTimeDuration === hrs;
+                          return (
+                            <TouchableOpacity
+                              key={`ft-dur-${hrs}`}
+                              activeOpacity={0.8}
+                              style={[
+                                styles.settingsDurationOptionChip,
+                                isSelected &&
+                                  styles.settingsDurationOptionChipActive,
+                              ]}
+                              onPress={() => {
+                                setFreeTimeDuration(hrs);
+                                setFreeTimeDurationDropdownOpen(false);
+                              }}
+                            >
+                              <Text
+                                style={[
+                                  styles.settingsDurationOptionChipText,
+                                  isSelected &&
+                                    styles.settingsDurationOptionChipTextActive,
+                                ]}
+                              >
+                                {hrs}h
+                              </Text>
+                            </TouchableOpacity>
+                          );
+                        })}
+                      </View>
+                    )}
                   </View>
 
                   {/* Feature 6: "Custom Palette" Generator (3 Modes + Interactive Visual Color Picker) */}
@@ -5342,7 +5491,8 @@ export default function App() {
                   </Text>
                   {freeTimeCheckedAt && (
                     <Text style={styles.freeTimeSubHeader}>
-                      Tracked courses starting within 2 hours of{' '}
+                      Tracked courses starting within {freeTimeDuration}{' '}
+                      {freeTimeDuration === 1 ? 'hour' : 'hours'} of{' '}
                       {DAYS[freeTimeCheckedAt.getDay()] || 'Today'}{' '}
                       {formatHour(
                         freeTimeCheckedAt.getHours() +
@@ -5369,11 +5519,13 @@ export default function App() {
               ) : spontaneousEvents.length === 0 ? (
                 <View style={styles.emptyFreeTimeBox}>
                   <Text style={styles.emptyFreeTimeTitle}>
-                    No Sessions Starting in the Next 2 Hours
+                    No Sessions Starting in the Next {freeTimeDuration}{' '}
+                    {freeTimeDuration === 1 ? 'Hour' : 'Hours'}
                   </Text>
                   <Text style={styles.emptyFreeTimeSub}>
                     None of your {trackedCourseIds.length} tracked course(s) have a
-                    lecture or tutorial starting within the next 2 hours. Enjoy your
+                    lecture or tutorial starting within the next {freeTimeDuration}{' '}
+                    {freeTimeDuration === 1 ? 'hour' : 'hours'}. Enjoy your
                     break!
                   </Text>
                 </View>
@@ -6752,6 +6904,68 @@ const styles = StyleSheet.create({
   settingsPaletteContainer: {
     paddingHorizontal: 14,
     paddingVertical: 12,
+  },
+  settingsDurationContainer: {
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    borderBottomWidth: 1,
+    borderBottomColor: '#1F2937',
+  },
+  settingsDurationHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  settingsDurationDropdownBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: '#1F2937',
+    borderWidth: 1,
+    borderColor: '#3B82F6',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+  },
+  settingsDurationDropdownBtnText: {
+    color: '#F9FAFB',
+    fontSize: 13.5,
+    fontWeight: '800',
+  },
+  settingsDurationDropdownArrow: {
+    color: '#93C5FD',
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  settingsDurationChipsGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginTop: 10,
+  },
+  settingsDurationOptionChip: {
+    flex: 1,
+    minWidth: 52,
+    backgroundColor: '#1F2937',
+    borderWidth: 1,
+    borderColor: '#374151',
+    borderRadius: 8,
+    paddingVertical: 7,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  settingsDurationOptionChipActive: {
+    backgroundColor: '#2563EB',
+    borderColor: '#60A5FA',
+  },
+  settingsDurationOptionChipText: {
+    color: '#D1D5DB',
+    fontSize: 12.5,
+    fontWeight: '700',
+  },
+  settingsDurationOptionChipTextActive: {
+    color: '#FFFFFF',
+    fontWeight: '800',
   },
   settingsPaletteHeaderRow: {
     flexDirection: 'row',
