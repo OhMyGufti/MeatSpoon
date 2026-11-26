@@ -2,10 +2,15 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   ASYNC_STORAGE_KEY,
+  CourseCatalogItem,
   CourseTask,
   LocalBackupPayload,
   ScheduleEvent,
 } from '../types/schedule';
+import {
+  loadCachedCheeseforkCatalog,
+  mergeIdenticalCourseGroups,
+} from '../services/cheesefork';
 import { isTaskDismissed } from '../services/moodleSync';
 import { DEFAULT_COLOR_PALETTE } from '../utils/colorPalette';
 
@@ -33,6 +38,16 @@ export type WidgetTimelineListItem =
       axisHourLabels: string[];
     }
   | {
+      kind: 'gap';
+      gapStartHour: number;
+      gapEndHour: number;
+      durationHours: number;
+      /**
+       * Defined (0..1) when `now` falls inside this time gap between two non-consecutive events.
+       */
+      nowProgress?: number;
+    }
+  | {
       kind: 'now';
     };
 
@@ -43,9 +58,19 @@ export interface AndroidWidgetSnapshot {
   freeTimeDuration: number;
   hasFreeTimeInWindow: boolean;
   widgetShowTimeAxis: boolean;
+  widgetFitToLength: boolean;
 }
 
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+const DEFAULT_SPECIAL_GROUP_FILTERS: Record<string, boolean> = {
+  '70-79': false,
+  '80-89': true,
+  '90-99': false,
+  '50-69': true,
+  '40-49': true,
+  '00-01': false,
+};
 
 function toLocalDateISO(date: Date): string {
   const y = date.getFullYear();
@@ -67,7 +92,10 @@ export function formatWidgetHour(decHour: number): string {
 
 function buildEventAxisHourLabels(startHour: number, endHour: number): string[] {
   const firstH = Math.max(0, Math.min(23, Math.floor(startHour)));
-  const lastH = Math.max(firstH, Math.min(23, Math.floor(Math.max(startHour, endHour - 0.01))));
+  const lastH = Math.max(
+    firstH,
+    Math.min(23, Math.floor(Math.max(startHour, endHour - 0.01)))
+  );
   const labels: string[] = [];
   for (let h = firstH; h <= lastH; h++) {
     labels.push(`${String(h).padStart(2, '0')}:00`);
@@ -95,6 +123,71 @@ function normalizeHexForWidget(
     return trimmed as `#${string}`;
   }
   return fallback;
+}
+
+function normalizeCourseDigits(rawId?: string): string[] {
+  if (!rawId) return [];
+  const digits = rawId.replace(/\D/g, '');
+  if (!digits) return [rawId.trim()];
+  const variants = new Set<string>([digits]);
+  if (digits.length === 6) {
+    variants.add(`0${digits}0`);
+    variants.add(`0${digits.slice(0, 3)}0${digits.slice(3)}`);
+    variants.add(digits.padStart(8, '0'));
+  } else if (digits.length === 8) {
+    if (digits.startsWith('0') && digits.endsWith('0')) {
+      variants.add(digits.slice(1, 7));
+    }
+    if (digits.startsWith('0') && digits[4] === '0') {
+      variants.add(`${digits.slice(1, 4)}${digits.slice(5)}`);
+    }
+    variants.add(digits.replace(/^0+/, ''));
+  }
+  return Array.from(variants);
+}
+
+function doesCourseIdMatch(idA?: string, idB?: string): boolean {
+  if (!idA || !idB) return false;
+  if (idA.trim() === idB.trim()) return true;
+  const varsA = normalizeCourseDigits(idA);
+  const varsB = new Set(normalizeCourseDigits(idB));
+  return varsA.some((v) => varsB.has(v));
+}
+
+function isGroupAllowedByFilters(
+  rawGroupId: string,
+  includedFilterIds: Record<string, boolean>
+): boolean {
+  const trimmed = rawGroupId.replace(/[\[\]]/g, '').trim();
+  const parsedNum = parseInt(trimmed, 10);
+  if (Number.isNaN(parsedNum)) return true;
+
+  if (parsedNum >= 70 && parsedNum <= 79) {
+    return Boolean(includedFilterIds['70-79']);
+  }
+  if (parsedNum >= 80 && parsedNum <= 89) {
+    return Boolean(includedFilterIds['80-89']);
+  }
+  if (parsedNum >= 90 && parsedNum <= 99) {
+    return Boolean(includedFilterIds['90-99']);
+  }
+  if (parsedNum >= 50 && parsedNum <= 69) {
+    return Boolean(includedFilterIds['50-69']);
+  }
+  if (parsedNum >= 40 && parsedNum <= 49) {
+    return Boolean(includedFilterIds['40-49']);
+  }
+  if (
+    parsedNum === 0 ||
+    parsedNum === 1 ||
+    trimmed === '00' ||
+    trimmed === '01' ||
+    trimmed === '0' ||
+    trimmed === '1'
+  ) {
+    return Boolean(includedFilterIds['00-01']);
+  }
+  return true;
 }
 
 /**
@@ -148,6 +241,121 @@ export function checkFreeTimeInLookaheadWindow(
   return busyHours < safeDuration - 0.02;
 }
 
+/**
+ * Checks whether there is AT LEAST ONE lecture, tutorial, or lab session from the user's
+ * tracked courses starting within `[currentDecHour, currentDecHour + durationHours]`,
+ * matching the exact logic of the in-app "Free Time / יש לי זמן פנוי" spontaneous finder.
+ */
+export function hasTrackedCourseSessionStartingInWindow(
+  activeCatalog: CourseCatalogItem[],
+  events: ScheduleEvent[],
+  tasks: CourseTask[],
+  desiredCourseIds: string[],
+  includedSpecialGroups: Record<string, boolean>,
+  currentDay: number,
+  currentDecHour: number,
+  durationHours: number
+): boolean {
+  const safeDuration = Math.max(1, Math.min(8, Math.round(durationHours || 2)));
+  const windowEndHour = currentDecHour + safeDuration;
+
+  // Collect all tracked course IDs from events, desiredCourseIds, and tasks
+  const trackedIdSet = new Set<string>();
+  for (const ev of events) {
+    if (ev.courseId) {
+      trackedIdSet.add(ev.courseId);
+    } else if (ev.type !== 'Custom' && ev.title) {
+      const byTitle = activeCatalog.find(
+        (c) => c.name.trim().toLowerCase() === ev.title.trim().toLowerCase()
+      );
+      if (byTitle) trackedIdSet.add(byTitle.courseId);
+    }
+  }
+  for (const cid of desiredCourseIds) {
+    if (cid) trackedIdSet.add(cid);
+  }
+  for (const tsk of tasks) {
+    if (tsk.courseId) {
+      trackedIdSet.add(tsk.courseId);
+    } else if (tsk.relationKey && tsk.relationKey.startsWith('course:')) {
+      const rawCid = tsk.relationKey.slice('course:'.length).trim();
+      if (rawCid) trackedIdSet.add(rawCid);
+    }
+  }
+
+  // 1. Check all session components (Lecture, Tutorial, Lab) of followed courses in catalog
+  const followedCoursesMap = new Map<string, CourseCatalogItem>();
+  for (const cid of trackedIdSet) {
+    const matched = activeCatalog.find((c) =>
+      doesCourseIdMatch(c.courseId, cid)
+    );
+    if (matched) {
+      followedCoursesMap.set(matched.courseId, matched);
+    }
+  }
+  for (const ev of events) {
+    if (ev.type === 'Custom' && !ev.courseId) continue;
+    const matched = activeCatalog.find(
+      (c) =>
+        doesCourseIdMatch(c.courseId, ev.courseId) ||
+        (ev.title &&
+          c.name.trim().toLowerCase() === ev.title.trim().toLowerCase())
+    );
+    if (matched) {
+      followedCoursesMap.set(matched.courseId, matched);
+    }
+  }
+
+  const sessionTypes: Array<'Lecture' | 'Tutorial' | 'Lab'> = [
+    'Lecture',
+    'Tutorial',
+    'Lab',
+  ];
+
+  for (const course of followedCoursesMap.values()) {
+    const candidateGroups: CourseCatalogItem['groups'] = [];
+    for (const sType of sessionTypes) {
+      const groupsOfType = course.groups.filter((g) => g.type === sType);
+      if (groupsOfType.length === 0) continue;
+      const allowedOfType = groupsOfType.filter((g) =>
+        isGroupAllowedByFilters(g.groupId, includedSpecialGroups)
+      );
+      candidateGroups.push(
+        ...(allowedOfType.length > 0 ? allowedOfType : groupsOfType)
+      );
+    }
+
+    const mergedGroups = mergeIdenticalCourseGroups(candidateGroups);
+    for (const grp of mergedGroups) {
+      for (const sess of grp.sessions) {
+        if (
+          sess.day === currentDay &&
+          sess.startHour >= currentDecHour &&
+          sess.startHour <= windowEndHour
+        ) {
+          return true;
+        }
+      }
+    }
+  }
+
+  // 2. Fallback check against course events directly in the user's schedule state
+  for (const ev of events) {
+    if (ev.type === 'Custom' || ev.type === 'Exam' || ev.type === 'Task') {
+      continue;
+    }
+    if (
+      ev.day === currentDay &&
+      ev.startHour >= currentDecHour &&
+      ev.startHour <= windowEndHour
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 export async function loadAndroidWidgetSnapshot(
   now: Date = new Date()
 ): Promise<AndroidWidgetSnapshot> {
@@ -168,6 +376,9 @@ export async function loadAndroidWidgetSnapshot(
     ? parsed.events
     : [];
   const tasks: CourseTask[] = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+  const desiredCourseIds: string[] = Array.isArray(parsed.desiredCourseIds)
+    ? parsed.desiredCourseIds
+    : [];
   const dismissedTaskIds: string[] = Array.isArray(parsed.dismissedTaskIds)
     ? parsed.dismissedTaskIds
     : [];
@@ -175,10 +386,17 @@ export async function loadAndroidWidgetSnapshot(
     parsed.hiddenKeys && typeof parsed.hiddenKeys === 'object'
       ? parsed.hiddenKeys
       : {};
+  const includedSpecialGroups: Record<string, boolean> =
+    parsed.includedSpecialGroups &&
+    typeof parsed.includedSpecialGroups === 'object'
+      ? { ...DEFAULT_SPECIAL_GROUP_FILTERS, ...parsed.includedSpecialGroups }
+      : DEFAULT_SPECIAL_GROUP_FILTERS;
+
   const rawDuration =
     typeof parsed.freeTimeDuration === 'number' ? parsed.freeTimeDuration : 2;
   const freeTimeDuration = Math.max(1, Math.min(8, Math.round(rawDuration)));
   const widgetShowTimeAxis = Boolean(parsed.widgetShowTimeAxis);
+  const widgetFitToLength = Boolean(parsed.widgetFitToLength);
 
   const palette =
     parsed.customPaletteEnabled &&
@@ -247,9 +465,41 @@ export async function loadAndroidWidgetSnapshot(
   const timelineItems: WidgetTimelineListItem[] = [];
   let insertedStandaloneNowLine = hasOngoingEvent;
 
-  for (const ev of todayEvents) {
-    // If not inside any ongoing event, insert the standalone gray timeline row before the first future event
-    if (!insertedStandaloneNowLine && currentDecHour < ev.startHour) {
+  for (let i = 0; i < todayEvents.length; i++) {
+    const ev = todayEvents[i];
+    const prevEv = i > 0 ? todayEvents[i - 1] : null;
+
+    if (prevEv && ev.startHour - prevEv.endHour > 5 / 60) {
+      // Non-consecutive events (gap > 5 minutes): insert a visual gap spacer
+      const gapStartHour = prevEv.endHour;
+      const gapEndHour = ev.startHour;
+      const gapDuration = gapEndHour - gapStartHour;
+
+      let nowProgress: number | undefined = undefined;
+      if (
+        !insertedStandaloneNowLine &&
+        currentDecHour >= gapStartHour &&
+        currentDecHour < gapEndHour
+      ) {
+        nowProgress = Math.max(
+          0,
+          Math.min(
+            1,
+            (currentDecHour - gapStartHour) / Math.max(0.1, gapDuration)
+          )
+        );
+        insertedStandaloneNowLine = true;
+      }
+
+      timelineItems.push({
+        kind: 'gap',
+        gapStartHour,
+        gapEndHour,
+        durationHours: gapDuration,
+        nowProgress,
+      });
+    } else if (!insertedStandaloneNowLine && currentDecHour < ev.startHour) {
+      // Before the first event (or between back-to-back events)
       timelineItems.push({ kind: 'now' });
       insertedStandaloneNowLine = true;
     }
@@ -277,12 +527,31 @@ export async function loadAndroidWidgetSnapshot(
     timelineItems.push({ kind: 'now' });
   }
 
-  // 4. Determine if there is any free time within the next `freeTimeDuration` hours
-  const hasFreeTimeInWindow = checkFreeTimeInLookaheadWindow(
+  // 4. Determine FreeTimeWidget color vs. grayscale state:
+  // Full color ONLY when:
+  // (a) the user has free time in the next `freeTimeDuration` hours, AND
+  // (b) there is at least one tracked-course session starting within the next `freeTimeDuration` hours.
+  const hasFreeGap = checkFreeTimeInLookaheadWindow(
     todayEvents,
     currentDecHour,
     freeTimeDuration
   );
+
+  let hasFreeTimeInWindow = false;
+  if (hasFreeGap) {
+    const cachedCatalog = await loadCachedCheeseforkCatalog();
+    const hasSpontaneousSession = hasTrackedCourseSessionStartingInWindow(
+      cachedCatalog,
+      events,
+      tasks,
+      desiredCourseIds,
+      includedSpecialGroups,
+      todayDay,
+      currentDecHour,
+      freeTimeDuration
+    );
+    hasFreeTimeInWindow = hasSpontaneousSession;
+  }
 
   return {
     dayHeaderLabel,
@@ -291,5 +560,6 @@ export async function loadAndroidWidgetSnapshot(
     freeTimeDuration,
     hasFreeTimeInWindow,
     widgetShowTimeAxis,
+    widgetFitToLength,
   };
 }

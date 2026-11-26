@@ -14,6 +14,7 @@ import type {
 
 export interface DailyScheduleWidgetProps {
   snapshot: AndroidWidgetSnapshot;
+  widgetHeightDp?: number;
 }
 
 const TIME_AXIS_WIDTH = 34;
@@ -51,18 +52,136 @@ function renderCleanGrayTimelineBar() {
   );
 }
 
+/**
+ * Renders a visual spacer row between two non-consecutive events (with optional gray timeline inside if `now` falls in the gap).
+ */
+function renderGapSpacerRow(
+  item: Extract<WidgetTimelineListItem, { kind: 'gap' }>,
+  idx: number,
+  showTimeAxis: boolean,
+  explicitGapHeightDp?: number
+) {
+  const gapHeight =
+    typeof explicitGapHeightDp === 'number'
+      ? Math.max(10, Math.round(explicitGapHeightDp))
+      : Math.max(16, Math.min(28, Math.round(14 + item.durationHours * 4)));
+
+  const hasNowInGap = typeof item.nowProgress === 'number';
+  const nowTopOffset = hasNowInGap
+    ? Math.max(
+        2,
+        Math.min(
+          Math.max(2, gapHeight - 7),
+          Math.round((item.nowProgress || 0.5) * (gapHeight - 7))
+        )
+      )
+    : 0;
+
+  const gapBody = hasNowInGap ? (
+    <FlexWidget
+      style={{
+        width: 'match_parent',
+        height: gapHeight,
+        flexDirection: 'column',
+      }}
+    >
+      <FlexWidget
+        style={{
+          width: 'match_parent',
+          height: nowTopOffset,
+        }}
+      />
+      {renderCleanGrayTimelineBar()}
+    </FlexWidget>
+  ) : (
+    <FlexWidget
+      style={{
+        width: 'match_parent',
+        height: gapHeight,
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+      }}
+    >
+      <FlexWidget
+        style={{
+          width: 18,
+          height: 2,
+          borderRadius: 1,
+          backgroundColor: '#374151',
+        }}
+      />
+    </FlexWidget>
+  );
+
+  if (!showTimeAxis) {
+    return (
+      <FlexWidget
+        key={`gap-${idx}`}
+        clickAction="OPEN_APP"
+        style={{
+          width: 'match_parent',
+          height: gapHeight,
+          backgroundColor: '#1E1E2E',
+        }}
+      >
+        {gapBody}
+      </FlexWidget>
+    );
+  }
+
+  return (
+    <FlexWidget
+      key={`gap-${idx}`}
+      clickAction="OPEN_APP"
+      style={{
+        width: 'match_parent',
+        height: gapHeight,
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: '#1E1E2E',
+      }}
+    >
+      {/* Keep Side Time Axis Column clean across the gap */}
+      <FlexWidget
+        style={{
+          width: TIME_AXIS_WIDTH,
+          height: gapHeight,
+        }}
+      />
+      <FlexWidget
+        style={{
+          flex: 1,
+          width: 'match_parent',
+          height: gapHeight,
+        }}
+      >
+        {gapBody}
+      </FlexWidget>
+    </FlexWidget>
+  );
+}
+
 function renderEventItemRow(
   item: Extract<WidgetTimelineListItem, { kind: 'event' }>,
   idx: number,
-  showTimeAxis: boolean
+  showTimeAxis: boolean,
+  explicitCardHeightDp?: number,
+  rowPaddingVertical = 2
 ) {
   const { event, color, timeRangeLabel, ongoingProgress, axisHourLabels } =
     item;
   const durationHours = Math.max(0.5, event.endHour - event.startHour);
-  const cardHeight = Math.max(
-    MIN_CARD_HEIGHT,
-    Math.round(durationHours * PIXELS_PER_HOUR_WIDGET)
-  );
+  const cardHeight =
+    typeof explicitCardHeightDp === 'number'
+      ? Math.max(28, Math.round(explicitCardHeightDp))
+      : Math.max(
+          MIN_CARD_HEIGHT,
+          Math.round(durationHours * PIXELS_PER_HOUR_WIDGET)
+        );
+
+  const isCompactFitCard = cardHeight < 44;
+  const isVeryCompactFitCard = cardHeight < 34;
 
   const subLine = [
     event.type,
@@ -80,39 +199,48 @@ function renderEventItemRow(
         flexDirection: 'column',
         justifyContent: 'center',
         backgroundColor: color || '#2563EB',
-        borderRadius: 8,
-        paddingHorizontal: 8,
-        paddingVertical: 5,
+        borderRadius: isCompactFitCard ? 6 : 8,
+        paddingHorizontal: isCompactFitCard ? 6 : 8,
+        paddingVertical: isCompactFitCard ? 2 : 5,
       }}
     >
       <TextWidget
-        text={timeRangeLabel}
+        text={
+          isVeryCompactFitCard
+            ? `${timeRangeLabel} • ${event.title || 'Class'}`
+            : timeRangeLabel
+        }
         maxLines={1}
+        truncate="END"
         style={{
           color: '#F3F4F6',
-          fontSize: 9,
+          fontSize: isCompactFitCard ? 8.5 : 9,
           fontWeight: 'bold',
         }}
       />
-      <TextWidget
-        text={event.title || 'Class'}
-        maxLines={1}
-        truncate="END"
-        style={{
-          color: '#FFFFFF',
-          fontSize: 11,
-          fontWeight: 'bold',
-        }}
-      />
-      <TextWidget
-        text={subLine || event.lecturer || '—'}
-        maxLines={1}
-        truncate="END"
-        style={{
-          color: '#E5E7EB',
-          fontSize: 9.5,
-        }}
-      />
+      {!isVeryCompactFitCard && (
+        <TextWidget
+          text={event.title || 'Class'}
+          maxLines={1}
+          truncate="END"
+          style={{
+            color: '#FFFFFF',
+            fontSize: isCompactFitCard ? 10 : 11,
+            fontWeight: 'bold',
+          }}
+        />
+      )}
+      {!isCompactFitCard && (
+        <TextWidget
+          text={subLine || event.lecturer || '—'}
+          maxLines={1}
+          truncate="END"
+          style={{
+            color: '#E5E7EB',
+            fontSize: 9.5,
+          }}
+        />
+      )}
     </FlexWidget>
   );
 
@@ -138,9 +266,9 @@ function renderEventItemRow(
             style={{
               width: 'match_parent',
               height: Math.max(
-                4,
+                3,
                 Math.min(
-                  cardHeight - 8,
+                  Math.max(3, cardHeight - 7),
                   Math.round(ongoingProgress * cardHeight)
                 )
               ),
@@ -153,6 +281,11 @@ function renderEventItemRow(
       eventCardBody
     );
 
+  const visibleAxisLabels =
+    isCompactFitCard && axisHourLabels.length > 1
+      ? [axisHourLabels[0]]
+      : axisHourLabels;
+
   if (!showTimeAxis) {
     return (
       <FlexWidget
@@ -160,7 +293,7 @@ function renderEventItemRow(
         clickAction="OPEN_APP"
         style={{
           width: 'match_parent',
-          paddingVertical: 2,
+          paddingVertical: rowPaddingVertical,
           backgroundColor: '#1E1E2E',
         }}
       >
@@ -177,7 +310,7 @@ function renderEventItemRow(
         width: 'match_parent',
         flexDirection: 'row',
         alignItems: 'center',
-        paddingVertical: 2,
+        paddingVertical: rowPaddingVertical,
         backgroundColor: '#1E1E2E',
       }}
     >
@@ -188,13 +321,13 @@ function renderEventItemRow(
           height: cardHeight,
           flexDirection: 'column',
           justifyContent:
-            axisHourLabels.length > 1 ? 'space-between' : 'flex-start',
+            visibleAxisLabels.length > 1 ? 'space-between' : 'flex-start',
           paddingTop: 2,
           paddingBottom: 2,
           paddingRight: 4,
         }}
       >
-        {axisHourLabels.map((lbl, hIdx) => (
+        {visibleAxisLabels.map((lbl, hIdx) => (
           <TextWidget
             key={`ax-${idx}-${hIdx}`}
             text={lbl}
@@ -222,7 +355,66 @@ function renderEventItemRow(
   );
 }
 
-export function DailyScheduleWidget({ snapshot }: DailyScheduleWidgetProps) {
+/**
+ * Computes fitted item heights when `widgetFitToLength` is enabled so all of today's
+ * events, gaps, and timeline rows fit inside the available widget height without scrolling.
+ */
+function computeFittedItemHeights(
+  timelineItems: WidgetTimelineListItem[],
+  widgetHeightDp: number,
+  pinnedTasksCount: number
+): number[] {
+  const effectiveTotalH =
+    widgetHeightDp && widgetHeightDp > 80 ? widgetHeightDp : 240;
+  const outerPad = 16; // 8 top + 8 bottom
+  const headerBarH = 31; // header height + marginBottom
+  const visiblePinnedCount = Math.min(3, pinnedTasksCount);
+  const pinnedBarH =
+    visiblePinnedCount > 0 ? visiblePinnedCount * 19 + 6 : 0;
+
+  const availableBodyH = Math.max(
+    80,
+    effectiveTotalH - outerPad - headerBarH - pinnedBarH
+  );
+
+  // Reserve fixed height for standalone 'now' rows and 2dp vertical padding per event row
+  let fixedReservedH = 0;
+  const rawWeights: number[] = [];
+
+  for (const item of timelineItems) {
+    if (item.kind === 'now') {
+      fixedReservedH += 11;
+      rawWeights.push(0);
+    } else if (item.kind === 'gap') {
+      // Subtle gap weight proportional to gap duration, clamped
+      const gapW = Math.max(0.28, Math.min(0.85, item.durationHours * 0.3));
+      rawWeights.push(gapW);
+    } else {
+      fixedReservedH += 2; // 1dp top + 1dp bottom row padding in fit mode
+      const dur = Math.max(0.75, item.event.endHour - item.event.startHour);
+      rawWeights.push(dur);
+    }
+  }
+
+  const distributableH = Math.max(48, availableBodyH - fixedReservedH);
+  const totalWeight = rawWeights.reduce((acc, w) => acc + w, 0) || 1;
+
+  return timelineItems.map((item, idx) => {
+    if (item.kind === 'now') {
+      return 11;
+    }
+    const share = (rawWeights[idx] / totalWeight) * distributableH;
+    if (item.kind === 'gap') {
+      return Math.max(10, Math.min(26, Math.round(share)));
+    }
+    return Math.max(28, Math.round(share));
+  });
+}
+
+export function DailyScheduleWidget({
+  snapshot,
+  widgetHeightDp = 240,
+}: DailyScheduleWidgetProps) {
   const dayHeaderLabel = snapshot?.dayHeaderLabel || 'Today';
   const pinnedTodayTasks = Array.isArray(snapshot?.pinnedTodayTasks)
     ? snapshot.pinnedTodayTasks
@@ -231,7 +423,72 @@ export function DailyScheduleWidget({ snapshot }: DailyScheduleWidgetProps) {
     ? snapshot.timelineItems
     : [];
   const showTimeAxis = Boolean(snapshot?.widgetShowTimeAxis);
+  const fitToLength = Boolean(snapshot?.widgetFitToLength);
   const hasEvents = timelineItems.some((item) => item.kind === 'event');
+
+  const fittedHeights =
+    fitToLength && hasEvents
+      ? computeFittedItemHeights(
+          timelineItems,
+          widgetHeightDp,
+          pinnedTodayTasks.length
+        )
+      : null;
+
+  const renderTimelineItem = (
+    item: WidgetTimelineListItem,
+    idx: number
+  ) => {
+    if (item.kind === 'now') {
+      return (
+        <FlexWidget
+          key={`timeline-now-${idx}`}
+          clickAction="OPEN_APP"
+          style={{
+            width: 'match_parent',
+            flexDirection: 'row',
+            alignItems: 'center',
+            paddingVertical: fitToLength ? 2 : 4,
+            backgroundColor: '#1E1E2E',
+          }}
+        >
+          {showTimeAxis && (
+            <FlexWidget
+              style={{
+                width: TIME_AXIS_WIDTH,
+                height: 7,
+              }}
+            />
+          )}
+          <FlexWidget
+            style={{
+              flex: 1,
+              width: 'match_parent',
+            }}
+          >
+            {renderCleanGrayTimelineBar()}
+          </FlexWidget>
+        </FlexWidget>
+      );
+    }
+
+    if (item.kind === 'gap') {
+      return renderGapSpacerRow(
+        item,
+        idx,
+        showTimeAxis,
+        fittedHeights ? fittedHeights[idx] : undefined
+      );
+    }
+
+    return renderEventItemRow(
+      item,
+      idx,
+      showTimeAxis,
+      fittedHeights ? fittedHeights[idx] : undefined,
+      fitToLength ? 1 : 2
+    );
+  };
 
   return (
     <FlexWidget
@@ -337,7 +594,7 @@ export function DailyScheduleWidget({ snapshot }: DailyScheduleWidgetProps) {
         </FlexWidget>
       )}
 
-      {/* Scrollable Vertical Events Strip (ListWidget) with Clean Gray Timeline Indicator */}
+      {/* Main Events Area: Empty State vs Non-Scrolling Fit-to-Length FlexWidget vs Scrollable ListWidget */}
       {!hasEvents ? (
         <FlexWidget
           clickAction="OPEN_APP"
@@ -379,6 +636,19 @@ export function DailyScheduleWidget({ snapshot }: DailyScheduleWidgetProps) {
             }}
           />
         </FlexWidget>
+      ) : fitToLength ? (
+        <FlexWidget
+          clickAction="OPEN_APP"
+          style={{
+            height: 'match_parent',
+            width: 'match_parent',
+            flexDirection: 'column',
+            justifyContent: 'space-between',
+            backgroundColor: '#1E1E2E',
+          }}
+        >
+          {timelineItems.map((item, idx) => renderTimelineItem(item, idx))}
+        </FlexWidget>
       ) : (
         <ListWidget
           style={{
@@ -387,42 +657,7 @@ export function DailyScheduleWidget({ snapshot }: DailyScheduleWidgetProps) {
             backgroundColor: '#1E1E2E',
           }}
         >
-          {timelineItems.map((item, idx) => {
-            if (item.kind === 'now') {
-              return (
-                <FlexWidget
-                  key={`timeline-now-${idx}`}
-                  clickAction="OPEN_APP"
-                  style={{
-                    width: 'match_parent',
-                    flexDirection: 'row',
-                    alignItems: 'center',
-                    paddingVertical: 4,
-                    backgroundColor: '#1E1E2E',
-                  }}
-                >
-                  {showTimeAxis && (
-                    <FlexWidget
-                      style={{
-                        width: TIME_AXIS_WIDTH,
-                        height: 8,
-                      }}
-                    />
-                  )}
-                  <FlexWidget
-                    style={{
-                      flex: 1,
-                      width: 'match_parent',
-                    }}
-                  >
-                    {renderCleanGrayTimelineBar()}
-                  </FlexWidget>
-                </FlexWidget>
-              );
-            }
-
-            return renderEventItemRow(item, idx, showTimeAxis);
-          })}
+          {timelineItems.map((item, idx) => renderTimelineItem(item, idx))}
         </ListWidget>
       )}
     </FlexWidget>

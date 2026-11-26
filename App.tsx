@@ -517,6 +517,7 @@ export default function App() {
   const [freeTimeDurationDropdownOpen, setFreeTimeDurationDropdownOpen] =
     useState<boolean>(false);
   const [widgetShowTimeAxis, setWidgetShowTimeAxis] = useState<boolean>(false);
+  const [widgetFitToLength, setWidgetFitToLength] = useState<boolean>(false);
   const [myCoursesPinned, setMyCoursesPinned] = useState<boolean>(true);
   const [dismissedTaskIds, setDismissedTaskIds] = useState<string[]>([]);
   const [myTasksModalVisible, setMyTasksModalVisible] = useState<boolean>(false);
@@ -1152,6 +1153,9 @@ export default function App() {
           if (typeof parsed.widgetShowTimeAxis === 'boolean') {
             setWidgetShowTimeAxis(parsed.widgetShowTimeAxis);
           }
+          if (typeof parsed.widgetFitToLength === 'boolean') {
+            setWidgetFitToLength(parsed.widgetFitToLength);
+          }
           if (typeof parsed.myCoursesPinned === 'boolean') {
             setMyCoursesPinned(parsed.myCoursesPinned);
           }
@@ -1239,6 +1243,7 @@ export default function App() {
     floatingMyTasks,
     freeTimeDuration,
     widgetShowTimeAxis,
+    widgetFitToLength,
     myCoursesPinned,
     customPaletteEnabled,
     customPaletteBaseHex,
@@ -1279,6 +1284,7 @@ export default function App() {
     floatingMyTasks,
     freeTimeDuration,
     widgetShowTimeAxis,
+    widgetFitToLength,
     myCoursesPinned,
     customPaletteEnabled,
     customPaletteBaseHex,
@@ -2194,6 +2200,10 @@ export default function App() {
       typeof parsed.widgetShowTimeAxis === 'boolean'
         ? parsed.widgetShowTimeAxis
         : widgetShowTimeAxis;
+    const nextWidgetFitToLength =
+      typeof parsed.widgetFitToLength === 'boolean'
+        ? parsed.widgetFitToLength
+        : widgetFitToLength;
     const nextMyCoursesPinned =
       typeof parsed.myCoursesPinned === 'boolean'
         ? parsed.myCoursesPinned
@@ -2303,6 +2313,7 @@ export default function App() {
     setFloatingMyTasks(nextFloatingMyTasks);
     setFreeTimeDuration(nextFreeTimeDuration);
     setWidgetShowTimeAxis(nextWidgetShowTimeAxis);
+    setWidgetFitToLength(nextWidgetFitToLength);
     setMyCoursesPinned(nextMyCoursesPinned);
     setCustomPaletteEnabled(nextCustomPaletteEnabled);
     setCustomPaletteMode(nextCustomPaletteMode);
@@ -2333,6 +2344,7 @@ export default function App() {
       floatingMyTasks: nextFloatingMyTasks,
       freeTimeDuration: nextFreeTimeDuration,
       widgetShowTimeAxis: nextWidgetShowTimeAxis,
+      widgetFitToLength: nextWidgetFitToLength,
       myCoursesPinned: nextMyCoursesPinned,
       customPaletteEnabled: nextCustomPaletteEnabled,
       customPaletteBaseHex: nextCustomPaletteBaseHex,
@@ -2462,6 +2474,7 @@ export default function App() {
     floatingMyTasks,
     freeTimeDuration,
     widgetShowTimeAxis,
+    widgetFitToLength,
     myCoursesPinned,
     customPaletteEnabled,
     customPaletteBaseHex,
@@ -3650,24 +3663,47 @@ export default function App() {
                     />
                   </View>
 
-                  {/* Android-Only Setting: "Show Times on Widget" (Side Time Axis on DailyScheduleWidget) */}
+                  {/* Android-Only Settings: "Show Times on Widget" & "Fit daily schedule to widget length" */}
                   {Platform.OS === 'android' && (
-                    <View style={styles.settingsOptionRow}>
-                      <Text
-                        style={[
-                          styles.settingsOptionText,
-                          styles.settingsToggleLabelText,
-                        ]}
-                      >
-                        Show Times on Widget
-                      </Text>
-                      <Switch
-                        value={widgetShowTimeAxis}
-                        onValueChange={setWidgetShowTimeAxis}
-                        trackColor={{ false: '#374151', true: '#2563EB' }}
-                        thumbColor={widgetShowTimeAxis ? '#FFFFFF' : '#9CA3AF'}
-                      />
-                    </View>
+                    <>
+                      <View style={styles.settingsOptionRow}>
+                        <Text
+                          style={[
+                            styles.settingsOptionText,
+                            styles.settingsToggleLabelText,
+                          ]}
+                        >
+                          Show Times on Widget
+                        </Text>
+                        <Switch
+                          value={widgetShowTimeAxis}
+                          onValueChange={setWidgetShowTimeAxis}
+                          trackColor={{ false: '#374151', true: '#2563EB' }}
+                          thumbColor={
+                            widgetShowTimeAxis ? '#FFFFFF' : '#9CA3AF'
+                          }
+                        />
+                      </View>
+
+                      <View style={styles.settingsOptionRow}>
+                        <Text
+                          style={[
+                            styles.settingsOptionText,
+                            styles.settingsToggleLabelText,
+                          ]}
+                        >
+                          Fit daily schedule to widget length
+                        </Text>
+                        <Switch
+                          value={widgetFitToLength}
+                          onValueChange={setWidgetFitToLength}
+                          trackColor={{ false: '#374151', true: '#2563EB' }}
+                          thumbColor={
+                            widgetFitToLength ? '#FFFFFF' : '#9CA3AF'
+                          }
+                        />
+                      </View>
+                    </>
                   )}
 
                   {/* Feature: "Free Time Duration" Dropdown/Picker (1h - 8h, default 2h) */}

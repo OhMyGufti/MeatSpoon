@@ -3,7 +3,7 @@
     "name": "MeatSpoon",
     "slug": "meatspoon-app",
     "scheme": "meatspoon",
-    "version": "1.2.2",
+    "version": "1.4.1",
     "orientation": "default",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
@@ -19,7 +19,7 @@
     },
     "android": {
       "package": "com.meatspoon.app",
-      "versionCode": 2,
+      "versionCode": 3,
       "googleServicesFile": "./google-services.json",
       "adaptiveIcon": {
         "foregroundImage": "./assets/icon.png",

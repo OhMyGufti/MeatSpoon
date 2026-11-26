@@ -91,6 +91,7 @@ export interface LocalBackupPayload {
   floatingMyTasks?: boolean;
   freeTimeDuration?: number;
   widgetShowTimeAxis?: boolean;
+  widgetFitToLength?: boolean;
   myCoursesPinned?: boolean;
   dismissedTaskIds?: string[];
   customPaletteEnabled?: boolean;

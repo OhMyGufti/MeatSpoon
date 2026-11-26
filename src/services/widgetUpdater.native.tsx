@@ -65,7 +65,12 @@ async function handleAndroidWidgetTask(
 
     switch (widgetInfo.widgetName) {
       case 'DailyScheduleWidget':
-        renderWidget(<DailyScheduleWidget snapshot={snapshot} />);
+        renderWidget(
+          <DailyScheduleWidget
+            snapshot={snapshot}
+            widgetHeightDp={widgetInfo.height}
+          />
+        );
         break;
       case 'FreeTimeWidget':
         renderWidget(
@@ -114,7 +119,12 @@ export async function refreshAllWidgets(): Promise<void> {
     await Promise.all([
       requestWidgetUpdate({
         widgetName: 'DailyScheduleWidget',
-        renderWidget: () => <DailyScheduleWidget snapshot={snapshot} />,
+        renderWidget: (info) => (
+          <DailyScheduleWidget
+            snapshot={snapshot}
+            widgetHeightDp={info.height}
+          />
+        ),
       }),
       requestWidgetUpdate({
         widgetName: 'FreeTimeWidget',
